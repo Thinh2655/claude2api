@@ -57,6 +57,7 @@ type Config struct {
 	MirrorApiPrefix        string        `yaml:"mirrorApiPrefix"`
 	EnableGateway          bool          `yaml:"enableGateway"` // phục vụ giao diện claude.ai tại localhost
 	GatewayKey             string        `yaml:"gatewayKey"`    // sessionKey gateway ưu tiên dùng; rỗng = tự chọn
+	CfClearance            string        `yaml:"cfClearance"`   // cookie cf_clearance từ trình duyệt đã pass Cloudflare challenge
 	RwMutx                 sync.RWMutex  `yaml:"-"`             // 不从YAML加载
 }
 
@@ -244,6 +245,8 @@ func loadConfigFromEnv() *Config {
 		EnableGateway: os.Getenv("ENABLE_GATEWAY") == "true",
 		// 网关优先使用的 sessionKey（可选）
 		GatewayKey: os.Getenv("GATEWAY_KEY"),
+		// Cloudflare cf_clearance cookie（可选，从已通过验证的浏览器复制）
+		CfClearance: os.Getenv("CF_CLEARANCE"),
 		// 设置读写锁
 		RwMutx: sync.RWMutex{},
 	}

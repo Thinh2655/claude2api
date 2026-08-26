@@ -4,6 +4,7 @@ import (
 	"bufio"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"claude2api/config"
 	"claude2api/logger"
 	"claude2api/model"
 	"encoding/base64"
@@ -108,6 +109,15 @@ func NewClient(sessionKey string, proxy string, model string) *Client {
 		Name:  "sessionKey",
 		Value: sessionKey,
 	})
+	// Optional Cloudflare clearance cookie from a browser that passed the
+	// JS challenge - raises the trust score of proxied requests. Note: it is
+	// tied to the browser's user-agent + IP, so keep those consistent.
+	if cf := config.ConfigInstance.CfClearance; cf != "" {
+		client.SetCommonCookies(&http.Cookie{
+			Name:  "cf_clearance",
+			Value: cf,
+		})
+	}
 	// Create default client with session key
 	c := &Client{
 		SessionKey: sessionKey,
