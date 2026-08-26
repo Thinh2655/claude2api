@@ -113,6 +113,16 @@ const keysPageHTML = `<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>Cloudflare cf_clearance</h2>
+    <div class="gw-row">
+      <input type="text" id="cfValue" placeholder="Dán giá trị cookie cf_clearance từ trình duyệt (bỏ trống = không dùng)" autocomplete="off" style="margin-bottom:0;">
+      <button onclick="saveCf()">Lưu</button>
+    </div>
+    <div class="msg" id="cfMsg"></div>
+    <div class="hint">Cookie này giúp request của proxy vượt Cloudflare dễ hơn. Cách lấy: mở claude.ai → F12 → Application → Cookies → claude.ai → copy giá trị <code style="background:none;padding:0;">cf_clearance</code>. Cookie gắn với user-agent + IP và hết hạn theo chu kỳ Cloudflare, khi lỗi 403 "Just a moment" hãy lấy lại.</div>
+  </div>
+
+  <div class="card">
     <h2>Thêm key mới</h2>
     <input type="text" id="newKey" placeholder="sk-ant-sid02-... (có thể dán nhiều key cách nhau bằng dấu phẩy)" autocomplete="off">
     <button class="btn-primary" onclick="addKey()">Thêm vào pool</button>
@@ -205,6 +215,25 @@ async function saveGatewayKey() {
   msg.className = res.ok ? 'msg success' : 'msg error';
 }
 
+async function loadCf() {
+  const res = await fetch('/keys/api/cf', { headers });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('cfValue').value = data.cfClearance || '';
+}
+
+async function saveCf() {
+  const msg = document.getElementById('cfMsg');
+  const value = document.getElementById('cfValue').value.trim();
+  const res = await fetch('/keys/api/cf', {
+    method: 'POST', headers,
+    body: JSON.stringify({ value })
+  });
+  const data = await res.json();
+  msg.textContent = data.message || data.error;
+  msg.className = res.ok ? 'msg success' : 'msg error';
+}
+
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
@@ -272,6 +301,7 @@ async function checkKeys(key) {
 }
 
 loadKeys();
+loadCf();
 setInterval(loadKeys, 15000);
 </script>
 </body>

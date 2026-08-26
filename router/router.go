@@ -26,6 +26,8 @@ func SetupRoutes(r *gin.Engine) {
 		authedKeys.GET("/gateway", service.GatewayKeyGetHandler)
 		authedKeys.POST("/gateway", service.GatewayKeySetHandler)
 		authedKeys.POST("/check", service.KeyCheckHandler)
+		authedKeys.GET("/cf", service.CfClearanceGetHandler)
+		authedKeys.POST("/cf", service.CfClearanceSetHandler)
 	}
 
 	// API routes use auth middleware per-group so the gateway can stay open

@@ -142,6 +142,28 @@ func GatewayKeySetHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Gateway key updated"})
 }
 
+// CfClearanceGetHandler returns the currently configured cf_clearance cookie
+func CfClearanceGetHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"cfClearance": config.ConfigInstance.GetCfClearance()})
+}
+
+// CfClearanceSetHandler stores the Cloudflare cf_clearance cookie
+func CfClearanceSetHandler(c *gin.Context) {
+	var body struct {
+		Value string `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"value\": \"<cf_clearance cookie or empty>\"}"})
+		return
+	}
+	value := strings.TrimSpace(body.Value)
+	config.ConfigInstance.SetCfClearance(value)
+	if err := saveEnvLine("CF_CLEARANCE", value); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist CF_CLEARANCE to .env: %v", err))
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "CF_CLEARANCE updated"})
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -167,7 +189,8 @@ func saveSessionsToEnv() error {
 }
 
 // saveEnvLine rewrites a single KEY=value line in .env (creates the file if missing).
-// An empty value keeps the line as "KEY=" so it can be filled in later.
+// Duplicate lines of the same key collapse into one; an empty value keeps the
+// line as "KEY=" so it can be filled in later.
 func saveEnvLine(name, value string) error {
 	path := ".env"
 	newLine := name + "=" + value
@@ -178,11 +201,14 @@ func saveEnvLine(name, value string) error {
 		for scanner.Scan() {
 			text := scanner.Text()
 			if strings.HasPrefix(text, name+"=") {
-				lines = append(lines, newLine)
-				found = true
-			} else {
-				lines = append(lines, text)
+				if !found {
+					lines = append(lines, newLine)
+					found = true
+				}
+				// drop duplicate lines of the same key
+				continue
 			}
+			lines = append(lines, text)
 		}
 		f.Close()
 	} else if !os.IsNotExist(err) {

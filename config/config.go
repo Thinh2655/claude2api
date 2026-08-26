@@ -112,6 +112,20 @@ func (c *Config) GetGatewayKey() string {
 	return c.GatewayKey
 }
 
+// SetCfClearance stores the Cloudflare clearance cookie
+func (c *Config) SetCfClearance(value string) {
+	c.RwMutx.Lock()
+	defer c.RwMutx.Unlock()
+	c.CfClearance = value
+}
+
+// GetCfClearance returns the Cloudflare clearance cookie
+func (c *Config) GetCfClearance() string {
+	c.RwMutx.RLock()
+	defer c.RwMutx.RUnlock()
+	return c.CfClearance
+}
+
 // AddSession appends a new session key if not already present. Returns true when added.
 func (c *Config) AddSession(sessionKey string) bool {
 	c.RwMutx.Lock()
