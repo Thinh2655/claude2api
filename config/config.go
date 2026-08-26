@@ -18,6 +18,24 @@ import (
 type SessionInfo struct {
 	SessionKey string `yaml:"sessionKey"`
 	OrgID      string `yaml:"orgID"`
+	// mu serializes requests on one session: concurrent requests would
+	// otherwise overwrite each other's paprika_mode (think mode) settings.
+	// Pointer so that SessionInfo copies share the same lock.
+	mu *sync.Mutex `yaml:"-"`
+}
+
+func (s *SessionInfo) Lock() {
+	s.mu.Lock()
+}
+
+func (s *SessionInfo) Unlock() {
+	s.mu.Unlock()
+}
+
+// NewSessionInfo creates a SessionInfo with an initialized lock, for sessions
+// that are not loaded from config (e.g. extracted from request headers)
+func NewSessionInfo(sessionKey, orgID string) *SessionInfo {
+	return &SessionInfo{SessionKey: sessionKey, OrgID: orgID, mu: &sync.Mutex{}}
 }
 
 type SessionRagen struct {
@@ -37,7 +55,9 @@ type Config struct {
 	PromptDisableArtifacts bool          `yaml:"promptDisableArtifacts"`
 	EnableMirrorApi        bool          `yaml:"enableMirrorApi"`
 	MirrorApiPrefix        string        `yaml:"mirrorApiPrefix"`
-	RwMutx                 sync.RWMutex  `yaml:"-"` // 不从YAML加载
+	EnableGateway          bool          `yaml:"enableGateway"` // phục vụ giao diện claude.ai tại localhost
+	GatewayKey             string        `yaml:"gatewayKey"`    // sessionKey gateway ưu tiên dùng; rỗng = tự chọn
+	RwMutx                 sync.RWMutex  `yaml:"-"`             // 不从YAML加载
 }
 
 // 解析 SESSION 格式的环境变量
@@ -54,17 +74,12 @@ func parseSessionEnv(envValue string) (int, []SessionInfo) {
 			continue
 		}
 		parts := strings.Split(pair, ":")
-		session := SessionInfo{
-			SessionKey: parts[0],
-		}
-
+		orgID := ""
 		if len(parts) > 1 {
-			session.OrgID = parts[1]
-		} else if len(parts) == 1 {
-			session.OrgID = ""
+			orgID = parts[1]
 		}
 
-		sessions = append(sessions, session)
+		sessions = append(sessions, *NewSessionInfo(parts[0], orgID))
 	}
 	if retryCount > 5 {
 		retryCount = 5 // 限制最大重试次数为 5 次
@@ -73,20 +88,60 @@ func parseSessionEnv(envValue string) (int, []SessionInfo) {
 }
 
 // 根据模型选择合适的 session
-func (c *Config) GetSessionForModel(idx int) (SessionInfo, error) {
+func (c *Config) GetSessionForModel(idx int) (*SessionInfo, error) {
 	if len(c.Sessions) == 0 || idx < 0 || idx >= len(c.Sessions) {
-		return SessionInfo{}, fmt.Errorf("invalid session index: %d", idx)
+		return nil, fmt.Errorf("invalid session index: %d", idx)
 	}
 	c.RwMutx.RLock()
 	defer c.RwMutx.RUnlock()
-	return c.Sessions[idx], nil
+	return &c.Sessions[idx], nil
+}
+
+// SetGatewayKey stores the preferred gateway session key
+func (c *Config) SetGatewayKey(key string) {
+	c.RwMutx.Lock()
+	defer c.RwMutx.Unlock()
+	c.GatewayKey = key
+}
+
+// GetGatewayKey returns the preferred gateway session key
+func (c *Config) GetGatewayKey() string {
+	c.RwMutx.RLock()
+	defer c.RwMutx.RUnlock()
+	return c.GatewayKey
+}
+
+// AddSession appends a new session key if not already present. Returns true when added.
+func (c *Config) AddSession(sessionKey string) bool {
+	c.RwMutx.Lock()
+	defer c.RwMutx.Unlock()
+	for i := range c.Sessions {
+		if c.Sessions[i].SessionKey == sessionKey {
+			return false
+		}
+	}
+	c.Sessions = append(c.Sessions, *NewSessionInfo(sessionKey, ""))
+	return true
+}
+
+// RemoveSession deletes the session with the given key. Returns true when removed.
+func (c *Config) RemoveSession(sessionKey string) bool {
+	c.RwMutx.Lock()
+	defer c.RwMutx.Unlock()
+	for i := range c.Sessions {
+		if c.Sessions[i].SessionKey == sessionKey {
+			c.Sessions = append(c.Sessions[:i], c.Sessions[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) SetSessionOrgID(sessionKey, orgID string) {
 	c.RwMutx.Lock()
 	defer c.RwMutx.Unlock()
-	for i, session := range c.Sessions {
-		if session.SessionKey == sessionKey {
+	for i := range c.Sessions {
+		if c.Sessions[i].SessionKey == sessionKey {
 			logger.Info(fmt.Sprintf("Setting OrgID for session %s to %s", sessionKey, orgID))
 			c.Sessions[i].OrgID = orgID
 			return
@@ -142,6 +197,9 @@ func loadConfigFromYAML(configPath string) (*Config, error) {
 
 	// 设置读写锁（不从YAML加载）
 	config.RwMutx = sync.RWMutex{}
+	for i := range config.Sessions {
+		config.Sessions[i].mu = &sync.Mutex{}
+	}
 
 	// 如果地址为空，使用默认值
 	if config.Address == "" {
@@ -182,8 +240,15 @@ func loadConfigFromEnv() *Config {
 		EnableMirrorApi: os.Getenv("ENABLE_MIRROR_API") == "true",
 		// 设置镜像API前缀
 		MirrorApiPrefix: os.Getenv("MIRROR_API_PREFIX"),
+		// 设置是否启用网关（本地模拟 claude.ai 网页）
+		EnableGateway: os.Getenv("ENABLE_GATEWAY") == "true",
+		// 网关优先使用的 sessionKey（可选）
+		GatewayKey: os.Getenv("GATEWAY_KEY"),
 		// 设置读写锁
 		RwMutx: sync.RWMutex{},
+	}
+	for i := range config.Sessions {
+		config.Sessions[i].mu = &sync.Mutex{}
 	}
 
 	// 如果地址为空，使用默认值
@@ -226,8 +291,8 @@ func init() {
 	ConfigInstance = LoadConfig()
 	logger.Info("Loaded config:")
 	logger.Info(fmt.Sprintf("Max Retry count: %d", ConfigInstance.RetryCount))
-	for _, session := range ConfigInstance.Sessions {
-		logger.Info(fmt.Sprintf("Session: %s, OrgID: %s", session.SessionKey, session.OrgID))
+	for i := range ConfigInstance.Sessions {
+		logger.Info(fmt.Sprintf("Session: %s, OrgID: %s", ConfigInstance.Sessions[i].SessionKey, ConfigInstance.Sessions[i].OrgID))
 	}
 	logger.Info(fmt.Sprintf("Address: %s", ConfigInstance.Address))
 	logger.Info(fmt.Sprintf("APIKey: %s", ConfigInstance.APIKey))
@@ -238,4 +303,5 @@ func init() {
 	logger.Info(fmt.Sprintf("PromptDisableArtifacts: %t", ConfigInstance.PromptDisableArtifacts))
 	logger.Info(fmt.Sprintf("EnableMirrorApi: %t", ConfigInstance.EnableMirrorApi))
 	logger.Info(fmt.Sprintf("MirrorApiPrefix: %s", ConfigInstance.MirrorApiPrefix))
+	logger.Info(fmt.Sprintf("EnableGateway: %t", ConfigInstance.EnableGateway))
 }

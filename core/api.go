@@ -2,9 +2,12 @@ package core
 
 import (
 	"bufio"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"claude2api/logger"
 	"claude2api/model"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,16 +48,46 @@ type ResponseEvent struct {
 	} `json:"error"`
 }
 
+// stableDeviceID derives a per-session UUID so claude.ai sees a consistent
+// "device" for each sessionKey, like the web app does for a browser.
+func stableDeviceID(sessionKey string) string {
+	h := sha256.Sum256([]byte("claude2api-device:" + sessionKey))
+	u := uuid.UUID(h[:16])
+	u[6] = (u[6] & 0x0f) | 0x40 // version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return u.String()
+}
+
+// randomTraceID returns a 32-hex-char W3C trace id
+func randomTraceID() string {
+	b := make([]byte, 16)
+	_, _ = cryptorand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// hexToDecString converts a hex chunk to its decimal string form (datadog ids)
+func hexToDecString(hexStr string) string {
+	v, err := strconv.ParseUint(hexStr, 16, 64)
+	if err != nil {
+		return "1"
+	}
+	return strconv.FormatUint(v, 10)
+}
+
 func NewClient(sessionKey string, proxy string, model string) *Client {
-	client := req.C().ImpersonateChrome().SetTimeout(time.Minute * 5)
-	client.Transport.SetResponseHeaderTimeout(time.Second * 10)
+	client := req.C().ImpersonateChrome().SetTimeout(time.Minute * 30)
+	// claude.ai often takes >10s to respond under load; a short header timeout
+	// causes intermittent request failures
+	client.Transport.SetResponseHeaderTimeout(time.Second * 120)
 	if proxy != "" {
 		client.SetProxyURL(proxy)
 	}
-	// Set common headers
+	// Set common headers - anthropic-device-id and the datadog trace headers
+	// mirror what a real browser session sends; without them claude.ai treats
+	// requests as bot traffic with much stricter rate limits
 	headers := map[string]string{
 		"accept":                    "text/event-stream, text/event-stream",
-		"accept-language":           "zh-CN,zh;q=0.9",
+		"accept-language":           "en-US,en;q=0.9",
 		"anthropic-client-platform": "web_claude_ai",
 		"content-type":              "application/json",
 		"origin":                    "https://claude.ai",
@@ -63,6 +96,13 @@ func NewClient(sessionKey string, proxy string, model string) *Client {
 	for key, value := range headers {
 		client.SetCommonHeader(key, value)
 	}
+	client.SetCommonHeader("anthropic-device-id", stableDeviceID(sessionKey))
+	traceID := randomTraceID()
+	client.SetCommonHeader("traceparent", fmt.Sprintf("00-%s-%s-01", traceID, traceID[len(traceID)-16:]))
+	client.SetCommonHeader("x-datadog-trace-id", hexToDecString(traceID[16:32]))
+	client.SetCommonHeader("x-datadog-parent-id", hexToDecString(traceID[len(traceID)-16:]))
+	client.SetCommonHeader("x-datadog-sampling-priority", "1")
+	client.SetCommonHeader("x-datadog-origin", "rum")
 	// Set cookies
 	client.SetCommonCookies(&http.Cookie{
 		Name:  "sessionKey",
@@ -169,10 +209,6 @@ func (c *Client) CreateConversation() (string, error) {
 		"name":                             "",
 		"include_conversation_preferences": true,
 	}
-	if c.model == "claude-sonnet-4-20250514" {
-		// 删除model
-		delete(requestBody, "model")
-	}
 
 	resp, err := c.client.R().
 		SetHeader("referer", "https://claude.ai/new").
@@ -207,9 +243,7 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 	// Create request body with default attributes
 	requestBody := c.defaultAttrs
 	requestBody["prompt"] = message
-	if c.model != "claude-sonnet-4-20250514" {
-		requestBody["model"] = c.model
-	}
+	requestBody["model"] = c.model
 	// Set up streaming response
 	resp, err := c.client.R().DisableAutoReadResponse().
 		SetHeader("referer", fmt.Sprintf("https://claude.ai/chat/%s", conversationID)).
@@ -228,10 +262,15 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 	if resp.StatusCode != http.StatusOK {
 		return resp.StatusCode, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
-	return 200, c.HandleResponse(resp.Body, stream, gc)
+	if err := c.HandleResponse(resp.Body, stream, gc); err != nil {
+		return 500, err
+	}
+	return 200, nil
 }
 
 // HandleResponse converts Claude's SSE format to OpenAI format and writes to the response writer
+// Returns nil if the request completed successfully (or the error came after content
+// was already streamed), or an error if it failed early enough to allow a clean retry.
 func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context) error {
 	defer body.Close()
 	// Set headers for streaming
@@ -244,6 +283,9 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 		gc.Writer.Flush()
 	}
 	scanner := bufio.NewScanner(body)
+	// SSE lines can be very large (artifacts / long code blocks); the default
+	// 64KB buffer aborts mid-stream with "token too long"
+	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 	clientDone := gc.Request.Context().Done()
 	// Keep track of the full response for the final message
 	thinkingShown := false
@@ -271,8 +313,14 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 		var event ResponseEvent
 		if err := json.Unmarshal([]byte(data), &event); err == nil {
 			if event.Type == "error" && event.Error.Message != "" {
-				model.ReturnOpenAIResponse(event.Error.Message, stream, gc)
-				return nil
+				if res_all_text != "" {
+					// Content was already streamed to the client; append the
+					// error message rather than failing the whole request
+					model.ReturnOpenAIResponse("\n\n"+event.Error.Message, stream, gc)
+					return nil
+				}
+				// Nothing streamed yet - propagate so the caller can retry
+				return errors.New(event.Error.Message)
 			}
 			if event.ContentBlock.Type == "tool_use" {
 				useTool = true

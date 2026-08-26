@@ -27,9 +27,9 @@ func HealthCheckHandler(c *gin.Context) {
 
 func MoudlesHandler(c *gin.Context) {
 	models := []map[string]interface{}{
-		{"id": "claude-3-7-sonnet-20250219"},
-		{"id": "claude-sonnet-4-20250514"},
-		{"id": "claude-opus-4-20250514"},
+		{"id": "claude-sonnet-4-6"},
+		{"id": "claude-haiku-4-5-20251001"},
+		{"id": "claude-sonnet-5"},
 	}
 
 	extendedModels := make([]map[string]interface{}, 0, len(models)*2)
@@ -47,6 +47,29 @@ func MoudlesHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": extendedModels,
 	})
+}
+
+// claude.ai retired the old model IDs; requests with them fail with 400
+// "Unsupported model". Map them onto the IDs claude.ai currently accepts so
+// existing API clients keep working.
+var legacyModelAliases = map[string]string{
+	"claude-3-7-sonnet-20250219": "claude-sonnet-4-6",
+	"claude-sonnet-4-20250514":   "claude-sonnet-4-6",
+	"claude-sonnet-4-5-20250929": "claude-sonnet-4-6",
+	"claude-opus-4-20250514":     "claude-sonnet-4-6",
+	"claude-opus-4-1-20250805":   "claude-sonnet-4-6",
+}
+
+func resolveModel(model string) string {
+	think := strings.HasSuffix(model, "-think")
+	base := strings.TrimSuffix(model, "-think")
+	if resolved, ok := legacyModelAliases[base]; ok {
+		base = resolved
+	}
+	if think {
+		return base + "-think"
+	}
+	return base
 }
 
 // ChatCompletionsHandler handles the chat completions endpoint
@@ -73,7 +96,8 @@ func ChatCompletionsHandler(c *gin.Context) {
 	// Get model or use default
 	model := getModelOrDefault(req.Model)
 	index := config.Sr.NextIndex()
-	// Attempt with retry mechanism
+	// Attempt with retry mechanism - no local cooldown bookkeeping: a 429
+	// just moves to the next session immediately
 	for i := 0; i < config.ConfigInstance.RetryCount; i++ {
 		index = (index + 1) % len(config.ConfigInstance.Sessions)
 		session, err := config.ConfigInstance.GetSessionForModel(index)
@@ -84,13 +108,17 @@ func ChatCompletionsHandler(c *gin.Context) {
 		}
 
 		logger.Info(fmt.Sprintf("Using session for model %s: %s", model, session.SessionKey))
-		if i > 0 {
-			processor.Prompt.Reset()
-			processor.Prompt.WriteString(processor.RootPrompt.String())
-		}
 		// Initialize client and process request
 		if handleChatRequest(c, session, model, processor, req.Stream) {
 			return // Success, exit the retry loop
+		}
+
+		// Client disconnected - no point in retrying
+		select {
+		case <-c.Request.Context().Done():
+			logger.Info("Client closed connection, stop retrying")
+			return
+		default:
 		}
 
 		// If we're here, the request failed - retry with another session
@@ -168,28 +196,31 @@ func parseAndValidateRequest(c *gin.Context) (*model.ChatCompletionRequest, erro
 
 func getModelOrDefault(model string) string {
 	if model == "" {
-		return "claude-3-7-sonnet-20250219"
+		return "claude-sonnet-4-6"
 	}
-	return model
+	return resolveModel(model)
 }
 
-func extractSessionFromAuthHeader(c *gin.Context) (config.SessionInfo, error) {
+func extractSessionFromAuthHeader(c *gin.Context) (*config.SessionInfo, error) {
 	authInfo := c.Request.Header.Get("Authorization")
 	authInfo = strings.TrimPrefix(authInfo, "Bearer ")
 
 	if authInfo == "" {
-		return config.SessionInfo{SessionKey: "", OrgID: ""}, fmt.Errorf("missing authorization header")
+		return config.NewSessionInfo("", ""), fmt.Errorf("missing authorization header")
 	}
 
 	if strings.Contains(authInfo, ":") {
 		parts := strings.Split(authInfo, ":")
-		return config.SessionInfo{SessionKey: parts[0], OrgID: parts[1]}, nil
+		return config.NewSessionInfo(parts[0], parts[1]), nil
 	}
 
-	return config.SessionInfo{SessionKey: authInfo, OrgID: ""}, nil
+	return config.NewSessionInfo(authInfo, ""), nil
 }
 
-func handleChatRequest(c *gin.Context, session config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) bool {
+func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) bool {
+	session.Lock()
+	defer session.Unlock()
+
 	// Initialize the Claude client
 	claudeClient := core.NewClient(session.SessionKey, config.ConfigInstance.Proxy, model)
 
@@ -230,8 +261,13 @@ func handleChatRequest(c *gin.Context, session config.SessionInfo, model string,
 	}
 
 	// Send message
-	if _, err := claudeClient.SendMessage(conversationID, processor.Prompt.String(), stream, c); err != nil {
+	statusCode, err := claudeClient.SendMessage(conversationID, processor.Prompt.String(), stream, c)
+	if err != nil {
 		logger.Error(fmt.Sprintf("Failed to send message: %v", err))
+		go cleanupConversation(claudeClient, conversationID, 3)
+		return false
+	}
+	if statusCode != http.StatusOK {
 		go cleanupConversation(claudeClient, conversationID, 3)
 		return false
 	}
