@@ -142,28 +142,6 @@ func GatewayKeySetHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Gateway key updated"})
 }
 
-// CfClearanceGetHandler returns the currently configured cf_clearance cookie
-func CfClearanceGetHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"cfClearance": config.ConfigInstance.GetCfClearance()})
-}
-
-// CfClearanceSetHandler stores the Cloudflare cf_clearance cookie
-func CfClearanceSetHandler(c *gin.Context) {
-	var body struct {
-		Value string `json:"value"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"value\": \"<cf_clearance cookie or empty>\"}"})
-		return
-	}
-	value := strings.TrimSpace(body.Value)
-	config.ConfigInstance.SetCfClearance(value)
-	if err := saveEnvLine("CF_CLEARANCE", value); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist CF_CLEARANCE to .env: %v", err))
-	}
-	c.JSON(http.StatusOK, gin.H{"message": "CF_CLEARANCE updated"})
-}
-
 func min(a, b int) int {
 	if a < b {
 		return a
