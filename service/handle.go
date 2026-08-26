@@ -253,22 +253,15 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		logger.Info(fmt.Sprintf("Prompt length exceeds max limit (%d), using file context", config.ConfigInstance.MaxChatHistoryLength))
 	}
 
-	// Create conversation
-	conversationID, err := claudeClient.CreateConversation()
-	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to create conversation: %v", err))
-		return false
-	}
-
-	// Send message
-	statusCode, err := claudeClient.SendMessage(conversationID, processor.Prompt.String(), stream, c)
+	// Single-request flow: create_conversation_params embedded in completion,
+	// mirroring the browser payload (halves upstream requests per message)
+	conversationID := claudeClient.PeekNewConversationID()
+	_, statusCode, err := claudeClient.SendMessageWithCreate(processor.Prompt.String(), stream, c)
 	if err != nil {
 		logger.Error(fmt.Sprintf("Failed to send message: %v", err))
-		go cleanupConversation(claudeClient, conversationID, 3)
 		return false
 	}
 	if statusCode != http.StatusOK {
-		go cleanupConversation(claudeClient, conversationID, 3)
 		return false
 	}
 

@@ -103,11 +103,12 @@ func NewClient(sessionKey string, proxy string, model string) *Client {
 	client.SetCommonHeader("x-datadog-parent-id", hexToDecString(traceID[len(traceID)-16:]))
 	client.SetCommonHeader("x-datadog-sampling-priority", "1")
 	client.SetCommonHeader("x-datadog-origin", "rum")
-	// Set cookies
-	client.SetCommonCookies(&http.Cookie{
-		Name:  "sessionKey",
-		Value: sessionKey,
-	})
+	// Set cookies - sessionKeyV3 mirrors what the web app sends alongside
+	// sessionKey; both carry the same value
+	client.SetCommonCookies(
+		&http.Cookie{Name: "sessionKey", Value: sessionKey},
+		&http.Cookie{Name: "sessionKeyV3", Value: sessionKey},
+	)
 	// Create default client with session key
 	c := &Client{
 		SessionKey: sessionKey,
@@ -231,6 +232,86 @@ func (c *Client) CreateConversation() (string, error) {
 		return "", errors.New("conversation UUID not found in response")
 	}
 	return uuid, nil
+}
+
+// SendMessageWithCreate mirrors the browser flow exactly: a single POST to
+// /completion with create_conversation_params embedded, so claude.ai creates
+// the conversation inline. Halves the number of upstream requests per message
+// compared to the create-then-send two-step flow.
+func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Context) (string, int, error) {
+	if c.orgID == "" {
+		return "", 500, errors.New("organization ID not set")
+	}
+
+	model := c.model
+	thinking := false
+	if strings.HasSuffix(model, "-think") {
+		model = strings.TrimSuffix(model, "-think")
+		thinking = true
+	}
+	paprika := interface{}(nil)
+	if thinking {
+		paprika = "extended"
+	}
+
+	requestBody := c.defaultAttrs
+	requestBody["prompt"] = message
+	requestBody["model"] = model
+	requestBody["locale"] = "en-US"
+	requestBody["thinking_mode"] = "auto"
+	if thinking {
+		requestBody["effort"] = "high"
+	} else {
+		requestBody["effort"] = "medium"
+	}
+	requestBody["turn_message_uuids"] = map[string]string{
+		"human_message_uuid":     uuid.New().String(),
+		"assistant_message_uuid": uuid.New().String(),
+	}
+	requestBody["create_conversation_params"] = map[string]interface{}{
+		"name":                             "",
+		"model":                            model,
+		"include_conversation_preferences": true,
+		"paprika_mode":                     paprika,
+		"is_temporary":                     false,
+	}
+
+	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/completion",
+		c.orgID, newConversationID())
+
+	resp, err := c.client.R().DisableAutoReadResponse().
+		SetHeader("referer", "https://claude.ai/new").
+		SetHeader("accept", "text/event-stream, text/event-stream").
+		SetHeader("anthropic-client-platform", "web_claude_ai").
+		SetHeader("cache-control", "no-cache").
+		SetBody(requestBody).
+		Post(url)
+	if err != nil {
+		return "", 500, fmt.Errorf("request failed: %w", err)
+	}
+	logger.Info(fmt.Sprintf("Claude response status code: %d", resp.StatusCode))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return "", http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", resp.StatusCode, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	c.model = model // remember trimmed model for cleanup calls
+	if err := c.HandleResponse(resp.Body, stream, gc); err != nil {
+		return "", 500, err
+	}
+	return "", 200, nil
+}
+
+func newConversationID() string {
+	return uuid.New().String()
+}
+
+// PeekNewConversationID generates the conversation UUID that
+// SendMessageWithCreate will use, so callers can reference it for cleanup
+// before the request completes.
+func (c *Client) PeekNewConversationID() string {
+	return newConversationID()
 }
 
 // SendMessage sends a message to a conversation and returns the status and response
