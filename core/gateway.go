@@ -145,8 +145,11 @@ func gatewayRewriteRequest(req *http.Request) {
 	}
 
 	// Rebuild the cookie header: drop our local token cookie and any upstream
-	// cookies, keep nothing else - claude.ai only needs the sessionKey
+	// cookies, then attach sessionKey + the optional Cloudflare clearance cookie
 	cookies := []string{fmt.Sprintf("sessionKey=%s", sessionKey)}
+	if cf := config.ConfigInstance.GetCfClearance(); cf != "" {
+		cookies = append(cookies, "cf_clearance="+cf)
+	}
 	req.Header.Set("Cookie", strings.Join(cookies, "; "))
 	req.Header.Set("Origin", claudeBaseURL)
 	req.Header.Set("Referer", claudeBaseURL+"/")
