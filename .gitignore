@@ -1,1 +1,8 @@
 .env
+cookie.json
+cookies.json
+accounts.json
+claude-ai-re-client/
+*.exe
+claude2api-linux-*
+rust-chat2api/

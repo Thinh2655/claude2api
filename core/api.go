@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/imroc/req/v3"
+	tls "github.com/refraction-networking/utls"
 )
 
 type Client struct {
@@ -48,6 +49,18 @@ type ResponseEvent struct {
 	} `json:"error"`
 }
 
+// toolUseInput is the JSON object carried by a tool_use input_json_delta. We
+// keep only the code-bearing fields (file_text, widget_code, content) plus a
+// couple of hints (language/type) for the fenced code block; command/path/
+// description/filepaths metadata is dropped from the streamed output.
+type toolUseInput struct {
+	FileText   string `json:"file_text"`
+	WidgetCode string `json:"widget_code"`
+	Content    string `json:"content"`
+	Language   string `json:"language"`
+	Type       string `json:"type"`
+}
+
 // stableDeviceID derives a per-session UUID so claude.ai sees a consistent
 // "device" for each sessionKey, like the web app does for a browser.
 func stableDeviceID(sessionKey string) string {
@@ -74,29 +87,180 @@ func hexToDecString(hexStr string) string {
 	return strconv.FormatUint(v, 10)
 }
 
+// ModelThinkingSpec mirrors the web client's thinking_by_model entry. For
+// effort_and_mode models the client can pick an effort (low/medium/high/xhigh);
+// for "mode" models there is no effort, only an extended-thinking toggle.
+type ModelThinkingSpec struct {
+	DefaultEffort string   // default effort if the id omits one
+	Mode          string   // off | auto | extended
+	Type          string   // effort_and_mode | mode
+	Efforts       []string // selectable efforts exposed in /v1/models (empty for mode-only)
+}
+
+// modelThinkingSpecs is the per-model thinking config for the free tier
+// (default_claude_ai). Only the three free models are listed. Keep order
+// stable so /v1/models is predictable.
+var modelThinkingSpecs = []struct {
+	ID   string
+	Spec ModelThinkingSpec
+}{
+	{"claude-sonnet-5", ModelThinkingSpec{
+		DefaultEffort: "high", Mode: "auto", Type: "effort_and_mode",
+		Efforts: []string{"low", "medium", "high"},
+	}},
+	{"claude-haiku-4-5-20251001", ModelThinkingSpec{
+		Mode: "extended", Type: "mode",
+	}},
+	{"claude-sonnet-4-6", ModelThinkingSpec{
+		DefaultEffort: "low", Mode: "off", Type: "effort_and_mode",
+		Efforts: []string{"low", "medium", "high"},
+	}},
+}
+
+// ModelIDs returns the list of model ids exposed in /v1/models. For
+// effort_and_mode models every selectable effort is a separate id, each with a
+// "-think" variant that forces extended thinking on. Mode-only models expose a
+// single base id plus a "-think" variant.
+func ModelIDs() []string {
+	var out []string
+	for _, m := range modelThinkingSpecs {
+		if len(m.Spec.Efforts) > 0 {
+			for _, eff := range m.Spec.Efforts {
+				out = append(out, m.ID+"-"+eff)
+				out = append(out, m.ID+"-"+eff+"-think")
+			}
+		} else {
+			out = append(out, m.ID)
+			out = append(out, m.ID+"-think")
+		}
+	}
+	return out
+}
+
+// specForModel looks up the thinking spec for a (base) model id. ok=false when
+// the model is not in the table; callers fall back to medium/auto.
+func specForModel(baseModel string) (ModelThinkingSpec, bool) {
+	for _, m := range modelThinkingSpecs {
+		if m.ID == baseModel {
+			return m.Spec, true
+		}
+	}
+	return ModelThinkingSpec{}, false
+}
+
+// knownEfforts returns the set of valid effort suffixes for a model (for
+// suffix parsing).
+func knownEfforts(spec ModelThinkingSpec) map[string]bool {
+	set := map[string]bool{}
+	for _, e := range spec.Efforts {
+		set[e] = true
+	}
+	return set
+}
+
+// ResolveThinking parses a model id of the form
+// "<base>[-effort][-think]" into the base model id, effort, thinking_mode and
+// paprika_mode to send in the completion body. The effort suffix (when the
+// model supports it) overrides the spec default; "-think" forces extended
+// thinking on (paprika_mode="extended"). Unknown models fall back to
+// effort=medium, mode=auto.
+func ResolveThinking(model string) (baseModel, effort, thinkingMode, paprikaMode string) {
+	thinking := strings.HasSuffix(model, "-think")
+	rest := strings.TrimSuffix(model, "-think")
+
+	// Find the matching spec by checking whether `rest` is "<base>" or
+	// "<base>-<effort>". Try longest base first so e.g. claude-sonnet-4-6 is
+	// matched before its "-6" tail is mistaken for an effort.
+	var base, eff string
+	var spec ModelThinkingSpec
+	var ok bool
+	for _, m := range modelThinkingSpecs {
+		if rest == m.ID {
+			base, spec, ok = m.ID, m.Spec, true
+			break
+		}
+		if strings.HasPrefix(rest, m.ID+"-") {
+			tail := strings.TrimPrefix(rest, m.ID+"-")
+			if knownEfforts(m.Spec)[tail] {
+				base, spec, eff, ok = m.ID, m.Spec, tail, true
+				break
+			}
+		}
+	}
+	if !ok {
+		// Unknown model: legacy default (medium/auto), think → extended.
+		effort, thinkingMode = "medium", "auto"
+		if thinking {
+			paprikaMode = "extended"
+		}
+		return rest, effort, thinkingMode, paprikaMode
+	}
+	baseModel = base
+	effort = eff
+	if effort == "" {
+		effort = spec.DefaultEffort
+	}
+	if effort == "" {
+		effort = "medium"
+	}
+	thinkingMode = spec.Mode
+	// "-think" forces extended thinking on regardless of the spec's default mode.
+	if thinking {
+		paprikaMode = "extended"
+	}
+	return baseModel, effort, thinkingMode, paprikaMode
+}
+
 func NewClient(sessionKey string, proxy string, model string) *Client {
-	client := req.C().ImpersonateChrome().SetTimeout(time.Minute * 30)
+	return NewClientWithCookie(sessionKey, proxy, model, "", "")
+}
+
+// NewClientWithCookie is NewClient plus an optional raw browser Cookie header
+// (cf, routingHint, …) and the matching anthropic device id for that browser.
+// Empty cookie means only sessionKey(s) are sent; empty deviceID falls back to
+// the per-session stable id so the upstream still sees a consistent device.
+func NewClientWithCookie(sessionKey string, proxy string, model string, cookie string, deviceID string) *Client {
+	// ImpersonateChrome() defaults to the utls Chrome 120 TLS fingerprint,
+	// which lags the current Chrome major version signed by actual browsers and
+	// can read as an older/emulated client. Override it with the newest client
+	// hello available in utls (Chrome 133) to keep the TLS profile fresh.
+	client := req.C().ImpersonateChrome().SetTLSFingerprint(tls.HelloChrome_133).SetTimeout(time.Minute * 30)
 	// claude.ai often takes >10s to respond under load; a short header timeout
-	// causes intermittent request failures
+	// causes intermittent request timeouts
 	client.Transport.SetResponseHeaderTimeout(time.Second * 120)
 	if proxy != "" {
 		client.SetProxyURL(proxy)
 	}
 	// Set common headers - anthropic-device-id and the datadog trace headers
 	// mirror what a real browser session sends; without them claude.ai treats
-	// requests as bot traffic with much stricter rate limits
+	// requests as bot traffic with much stricter rate limits.
+	// ImpersonateChrome() injects sec-fetch-mode: navigate + UA/sec-ch-ua of
+	// Chrome on macOS; that fingerprint is for a full-page navigation, NOT a
+	// same-origin fetch to the JSON API. The web UI sends these API calls as
+	// same-origin POSTs, so we must override those fields to match - otherwise
+	// Cloudflare flags the request as bot traffic.
 	headers := map[string]string{
-		"accept":                    "text/event-stream, text/event-stream",
-		"accept-language":           "en-US,en;q=0.9",
-		"anthropic-client-platform": "web_claude_ai",
-		"content-type":              "application/json",
-		"origin":                    "https://claude.ai",
-		"priority":                  "u=1, i",
+		"accept":                         "text/event-stream, text/event-stream",
+		"accept-language":                "en-US,en;q=0.9",
+		"anthropic-client-platform":      "web_claude_ai",
+		"content-type":                   "application/json",
+		"origin":                         "https://claude.ai",
+		"priority":                       "u=1, i",
+		"sec-ch-ua-platform":             `"Windows"`,
+		"sec-fetch-site":                 "same-origin",
+		"sec-fetch-mode":                 "cors",
+		"sec-fetch-dest":                 "empty",
+		"sec-fetch-user":                 "?0",
+		"user-agent":                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	}
 	for key, value := range headers {
 		client.SetCommonHeader(key, value)
 	}
-	client.SetCommonHeader("anthropic-device-id", stableDeviceID(sessionKey))
+	if deviceID != "" {
+		client.SetCommonHeader("anthropic-device-id", deviceID)
+	} else {
+		client.SetCommonHeader("anthropic-device-id", stableDeviceID(sessionKey))
+	}
 	traceID := randomTraceID()
 	client.SetCommonHeader("traceparent", fmt.Sprintf("00-%s-%s-01", traceID, traceID[len(traceID)-16:]))
 	client.SetCommonHeader("x-datadog-trace-id", hexToDecString(traceID[16:32]))
@@ -104,11 +268,26 @@ func NewClient(sessionKey string, proxy string, model string) *Client {
 	client.SetCommonHeader("x-datadog-sampling-priority", "1")
 	client.SetCommonHeader("x-datadog-origin", "rum")
 	// Set cookies - sessionKeyV3 mirrors what the web app sends alongside
-	// sessionKey; both carry the same value
-	client.SetCommonCookies(
-		&http.Cookie{Name: "sessionKey", Value: sessionKey},
-		&http.Cookie{Name: "sessionKeyV3", Value: sessionKey},
-	)
+	// sessionKey; both carry the same value. When an extra cookie header is
+	// configured (cf_bm, routingHint, …), it is merged with the session keys so
+	// the upstream sees the same browser state as the real web app.
+	if cookie == "" {
+		client.SetCommonCookies(
+			&http.Cookie{Name: "sessionKey", Value: sessionKey},
+			&http.Cookie{Name: "sessionKeyV3", Value: sessionKey},
+		)
+	} else {
+		// The cookie file already carries sessionKey/sessionKeyV3 values; only
+		// append them if the file lacks them (key mismatch from env sessions).
+		cookie = strings.TrimSpace(cookie)
+		if !strings.Contains(cookie, "sessionKey=") {
+			cookie += "; sessionKey=" + sessionKey
+		}
+		if !strings.Contains(cookie, "sessionKeyV3=") {
+			cookie += "; sessionKeyV3=" + sessionKey
+		}
+		client.SetCommonHeader("Cookie", cookie)
+	}
 	// Create default client with session key
 	c := &Client{
 		SessionKey: sessionKey,
@@ -187,22 +366,51 @@ func (c *Client) GetOrgID() (string, error) {
 
 }
 
+// AccountInfo is the subset of /api/account we use to label an account in the
+// UI (email) and classify it (rate_limit_tier on the org).
+type AccountInfo struct {
+	EmailAddress string `json:"email_address"`
+}
+
+// GetAccountEmail calls /api/account and returns the account's email address.
+// Used as the human-readable display name when a cookie account has no label.
+func (c *Client) GetAccountEmail() (string, error) {
+	resp, err := c.client.R().
+		SetHeader("referer", "https://claude.ai/").
+		SetHeader("accept", "application/json").
+		Get("https://claude.ai/api/account")
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	var acct AccountInfo
+	if err := json.Unmarshal(resp.Bytes(), &acct); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+	if acct.EmailAddress == "" {
+		return "", errors.New("no email_address in account response")
+	}
+	return acct.EmailAddress, nil
+}
+
 // CreateConversation creates a new conversation and returns its UUID
 func (c *Client) CreateConversation() (string, error) {
 	if c.orgID == "" {
 		return "", errors.New("organization ID not set")
 	}
 	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations", c.orgID)
-	// 如果以-think结尾
-	if strings.HasSuffix(c.model, "-think") {
-		c.model = strings.TrimSuffix(c.model, "-think")
-		if err := c.UpdateUserSetting("paprika_mode", "extended"); err != nil {
-			logger.Error(fmt.Sprintf("Failed to update paprika_mode: %v", err))
-		}
-	} else {
-		if err := c.UpdateUserSetting("paprika_mode", nil); err != nil {
-			logger.Error(fmt.Sprintf("Failed to update paprika_mode: %v", err))
-		}
+	// Resolve thinking effort/mode for this model; strip the "-think" suffix
+	// and set paprika_mode to "extended" only when the resolved mode wants it.
+	baseModel, _, _, paprikaMode := ResolveThinking(c.model)
+	c.model = baseModel
+	paprikaVal := interface{}(nil)
+	if paprikaMode != "" {
+		paprikaVal = paprikaMode
+	}
+	if err := c.UpdateUserSetting("paprika_mode", paprikaVal); err != nil {
+		logger.Error(fmt.Sprintf("Failed to update paprika_mode: %v", err))
 	}
 	requestBody := map[string]interface{}{
 		"model":                            c.model,
@@ -243,27 +451,18 @@ func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Cont
 		return "", 500, errors.New("organization ID not set")
 	}
 
-	model := c.model
-	thinking := false
-	if strings.HasSuffix(model, "-think") {
-		model = strings.TrimSuffix(model, "-think")
-		thinking = true
-	}
+	model, effort, thinkingMode, paprikaMode := ResolveThinking(c.model)
 	paprika := interface{}(nil)
-	if thinking {
-		paprika = "extended"
+	if paprikaMode != "" {
+		paprika = paprikaMode
 	}
 
 	requestBody := c.defaultAttrs
 	requestBody["prompt"] = message
 	requestBody["model"] = model
 	requestBody["locale"] = "en-US"
-	requestBody["thinking_mode"] = "auto"
-	if thinking {
-		requestBody["effort"] = "high"
-	} else {
-		requestBody["effort"] = "medium"
-	}
+	requestBody["thinking_mode"] = thinkingMode
+	requestBody["effort"] = effort
 	requestBody["turn_message_uuids"] = map[string]string{
 		"human_message_uuid":     uuid.New().String(),
 		"assistant_message_uuid": uuid.New().String(),
@@ -322,9 +521,28 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/completion",
 		c.orgID, conversationID)
 	// Create request body with default attributes
+	model, effort, thinkingMode, paprikaMode := ResolveThinking(c.model)
+	paprika := interface{}(nil)
+	if paprikaMode != "" {
+		paprika = paprikaMode
+	}
 	requestBody := c.defaultAttrs
 	requestBody["prompt"] = message
-	requestBody["model"] = c.model
+	requestBody["model"] = model
+	requestBody["locale"] = "en-US"
+	requestBody["thinking_mode"] = thinkingMode
+	requestBody["effort"] = effort
+	requestBody["turn_message_uuids"] = map[string]string{
+		"human_message_uuid":     uuid.New().String(),
+		"assistant_message_uuid": uuid.New().String(),
+	}
+	requestBody["create_conversation_params"] = map[string]interface{}{
+		"name":                             "",
+		"model":                            model,
+		"include_conversation_preferences": true,
+		"paprika_mode":                     paprika,
+		"is_temporary":                     false,
+	}
 	// Set up streaming response
 	resp, err := c.client.R().DisableAutoReadResponse().
 		SetHeader("referer", fmt.Sprintf("https://claude.ai/chat/%s", conversationID)).
@@ -354,14 +572,16 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 // was already streamed), or an error if it failed early enough to allow a clean retry.
 func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context) error {
 	defer body.Close()
-	// Set headers for streaming
+	// Set headers for streaming. The status is intentionally NOT committed
+	// here: writing 200 before reading the first event would lock the response
+	// in even if claude.ai answers with an error event before any content
+	// (e.g. a rate limit). net/http commits status 200 automatically on the
+	// first real Write below, so an early error can still propagate up and let
+	// the caller retry another session.
 	if stream {
 		gc.Writer.Header().Set("Content-Type", "text/event-stream")
 		gc.Writer.Header().Set("Cache-Control", "no-cache")
 		gc.Writer.Header().Set("Connection", "keep-alive")
-		// 发送200状态码
-		gc.Writer.WriteHeader(http.StatusOK)
-		gc.Writer.Flush()
 	}
 	scanner := bufio.NewScanner(body)
 	// SSE lines can be very large (artifacts / long code blocks); the default
@@ -372,10 +592,10 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	thinkingShown := false
 	res_all_text := ""
 	partial_json_shown := false
-	useTool := false
-	useToolEnd := false
-	nextLanguage := false
 	languageStr := "md"
+	// pendingJSON accumulates a tool_use input_json_delta object until it parses
+	// as a complete JSON object, so we can extract the code field intact.
+	pendingJSON := ""
 	for scanner.Scan() {
 		select {
 		case <-clientDone:
@@ -403,13 +623,45 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				// Nothing streamed yet - propagate so the caller can retry
 				return errors.New(event.Error.Message)
 			}
-			if event.ContentBlock.Type == "tool_use" {
-				useTool = true
-			}
-			if event.ContentBlock.Type == "tool_result" {
-				useToolEnd = true
-			}
 			if event.Type == "content_block_stop" {
+				// Flush any tool_use input still pending at block end. By now
+				// the object should parse; if it does and carries a code field,
+				// stream that. Otherwise drop the metadata.
+				if pendingJSON != "" {
+					var input toolUseInput
+					if err := json.Unmarshal([]byte(pendingJSON), &input); err == nil {
+						code := input.FileText
+						if code == "" {
+							code = input.WidgetCode
+						}
+						if code == "" {
+							code = input.Content
+						}
+						if code != "" {
+							out := code
+							if !partial_json_shown {
+								lang := input.Language
+								if lang == "" {
+									lang = input.Type
+								}
+								if lang == "text/html" || lang == "html" {
+									lang = "html"
+								}
+								if lang != "" {
+									languageStr = lang
+								}
+								out = "\n```" + languageStr + "\n" + out
+								partial_json_shown = true
+							}
+							res_all_text += out
+							if stream {
+								model.ReturnOpenAIResponse(out, stream, gc)
+							}
+						}
+					}
+					pendingJSON = ""
+					languageStr = "md"
+				}
 				res_text := ""
 				if thinkingShown {
 					res_text = "</think>\n"
@@ -449,69 +701,54 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				continue
 			}
 			if event.Delta.Type == "input_json_delta" {
-				res_text := event.Delta.PartialJSON
-				//结束使用工具了
-				if useTool && res_text == ",\"content\":" {
-					useTool = false
-					partial_json_shown = false
+				// input_json_delta carries a JSON-escaped fragment of a tool_use
+				// input object, e.g. {"command":"...","file_text":"<code>"}.
+				// We only want the code-bearing field (file_text / widget_code /
+				// content) streamed to the client, not the command/path/description
+				// metadata. Fragments can split escapes and multibyte chars, so we
+				// accumulate until the object parses and then stream the code field
+				// value (decoded, UTF-8 and quotes intact).
+				pendingJSON += event.Delta.PartialJSON
+				var input toolUseInput
+				if err := json.Unmarshal([]byte(pendingJSON), &input); err != nil {
+					// Object not complete yet (cut mid-escape/multibyte) — wait.
 					continue
 				}
-				//获取语言,下一次就是了
-				if res_text == ",\"language\":" || res_text == ",\"type\":" {
-					nextLanguage = true
+				// Pick the code field present in this tool input.
+				code := input.FileText
+				if code == "" {
+					code = input.WidgetCode
+				}
+				if code == "" {
+					code = input.Content
+				}
+				if code == "" {
+					// No code field — this is a non-code tool (read_me, web_search
+					// params, …): drop the metadata entirely.
+					pendingJSON = ""
 					continue
 				}
-				//获取语言注入
-				if nextLanguage {
-					languageStr = res_text[1:]
-					logger.Info(fmt.Sprintf("获取的语言为:%s", languageStr))
-					if languageStr == "text/html" {
-						languageStr = "html"
-					}
-					nextLanguage = false
-				}
-				//使用工具
-				if useTool {
-					logger.Info(fmt.Sprintf("useTool res_text:%s", res_text))
-					continue
-				}
-				//使用了工具结束拉
-				if useToolEnd {
-					useToolEnd = false
-					continue
-				}
-				//存在代码首字母为"的情况,特殊处理
-				if strings.HasPrefix(res_text, "\"") {
-					res_text = res_text[1:]
-				}
-				//可能会存在多出一个}的情况
-				if res_text == "\"}" || res_text == "}" {
-					res_text = ""
-				}
-				//转义
-				unquote, err := strconv.Unquote(fmt.Sprintf("\"%s\"", res_text))
-				if err == nil {
-					res_text = unquote
-				} else {
-					logger.Error(fmt.Sprintf("转化出错:%s", err.Error()))
-					res_text = strings.ReplaceAll(res_text, "\\\\n", "")
-					res_text = strings.ReplaceAll(res_text, "\\\\u", "\\u")
-					res_text = strings.ReplaceAll(res_text, "\\\"", "\"")
-					res_text = strings.ReplaceAll(res_text, "\\\\'", "'")
-					res_text = strings.ReplaceAll(res_text, "\\n", "\n")
-					res_text = strings.ReplaceAll(res_text, "\\t", "\t")
-					res_text = decodeUnicodeEscape(res_text)
-				}
-
+				out := code
+				// Open a fenced code block before the first artifact output.
 				if !partial_json_shown {
-					res_text = "\n```" + languageStr + "\n" + res_text
+					lang := input.Language
+					if lang == "" {
+						lang = input.Type
+					}
+					if lang == "text/html" || lang == "html" {
+						lang = "html"
+					}
+					if lang != "" {
+						languageStr = lang
+					}
+					out = "\n```" + languageStr + "\n" + out
 					partial_json_shown = true
 				}
-				res_all_text += res_text
-				if !stream {
-					continue
+				res_all_text += out
+				pendingJSON = ""
+				if stream {
+					model.ReturnOpenAIResponse(out, stream, gc)
 				}
-				model.ReturnOpenAIResponse(res_text, stream, gc)
 				continue
 			}
 		}
@@ -528,28 +765,6 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	}
 
 	return nil
-}
-func decodeUnicodeEscape(s string) string {
-	var result []rune
-	for i := 0; i < len(s); i++ {
-		// 检查是否是 Unicode 转义序列
-		if len(s)-i >= 6 && s[i:i+2] == "\\u" {
-			// 尝试解析 Unicode 码点
-			code, err := strconv.ParseInt(s[i+2:i+6], 16, 32)
-			if err == nil {
-				// 将码点转换为字符
-				result = append(result, rune(code))
-				// 跳过已处理的 Unicode 转义序列
-				i += 5
-			} else {
-				// 如果解析失败，保留原始字符
-				result = append(result, rune(s[i]))
-			}
-		} else {
-			result = append(result, rune(s[i]))
-		}
-	}
-	return string(result)
 }
 
 // DeleteConversation deletes a conversation by ID

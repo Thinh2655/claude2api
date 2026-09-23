@@ -66,6 +66,17 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// requestedModel echoes the model id the client asked for back in the
+// response: OpenAI clients expect the response model to match the request.
+func requestedModel(gc *gin.Context) string {
+	if v, ok := gc.Get("RequestedModel"); ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	return "claude-sonnet-5"
+}
+
 func ReturnOpenAIResponse(text string, stream bool, gc *gin.Context) error {
 	if stream {
 		return streamRespose(text, gc)
@@ -79,7 +90,7 @@ func streamRespose(text string, gc *gin.Context) error {
 		ID:      uuid.New().String(),
 		Object:  "chat.completion.chunk",
 		Created: time.Now().Unix(),
-		Model:   "claude-3-7-sonnet-20250219",
+		Model:   requestedModel(gc),
 		Choices: []StreamChoice{
 			{
 				Index: 0,
@@ -111,7 +122,7 @@ func noStreamResponse(text string, gc *gin.Context) error {
 		ID:      uuid.New().String(),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   "claude-3-7-sonnet-20250219",
+		Model:   requestedModel(gc),
 		Choices: []NoStreamChoice{
 			{
 				Index: 0,

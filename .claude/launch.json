@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "claude2api-gateway",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "set ADDRESS=0.0.0.0:8081&& D:\\claude2api\\claude2api-test.exe"],
+      "port": 8081,
+      "autoPort": false
+    }
+  ]
+}

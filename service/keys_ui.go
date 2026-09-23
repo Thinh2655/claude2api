@@ -11,7 +11,7 @@ const keysPageHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>claude2api - Quản lý Keys</title>
+<title>claude2api - Quản lý tài khoản</title>
 <style>
   :root {
     --bg: #0f1117; --card: #1a1d27; --border: #2a2e3f;
@@ -24,7 +24,7 @@ const keysPageHTML = `<!DOCTYPE html>
     background: var(--bg); color: var(--text);
     min-height: 100vh; padding: 2rem;
   }
-  .container { max-width: 720px; margin: 0 auto; }
+  .container { max-width: 760px; margin: 0 auto; }
   h1 { font-size: 1.5rem; margin-bottom: .25rem; }
   .subtitle { color: var(--muted); font-size: .9rem; margin-bottom: 2rem; }
   .card {
@@ -56,12 +56,13 @@ const keysPageHTML = `<!DOCTYPE html>
   button:hover { opacity: .85; }
   .btn-danger { background: rgba(248,113,113,.15); color: var(--err); }
   .btn-primary { background: var(--accent); color: #fff; width: 100%; padding: .7rem; font-size: .95rem; }
-  input[type=text] {
+  input[type=text], textarea {
     width: 100%; background: var(--bg); border: 1px solid var(--border);
     border-radius: 8px; padding: .7rem .9rem; color: var(--text);
     font-family: Consolas, monospace; font-size: .85rem; margin-bottom: .75rem;
   }
-  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  input[type=text]:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { min-height: 120px; resize: vertical; }
   .msg { margin-top: .75rem; font-size: .85rem; min-height: 1.2em; }
   .msg.error { color: var(--err); }
   .msg.success { color: var(--ok); }
@@ -84,15 +85,15 @@ const keysPageHTML = `<!DOCTYPE html>
 <div class="container">
   <div class="topbar">
     <div>
-      <h1>Quản lý Session Keys</h1>
+      <h1>Quản lý tài khoản (cookie)</h1>
       <div class="subtitle">claude2api &middot; <a href="/health">health</a></div>
     </div>
   </div>
 
   <div class="card">
-    <h2>Danh sách keys</h2>
+    <h2>Tài khoản</h2>
     <table id="keysTable">
-      <thead><tr><th>Session Key</th><th>Trạng thái</th><th></th></tr></thead>
+      <thead><tr><th>Tên acc</th><th>Trạng thái</th><th>Gateway</th><th></th></tr></thead>
       <tbody id="keysBody"></tbody>
     </table>
     <div style="margin-top:.75rem; display:flex; gap:.75rem; align-items:center;">
@@ -100,24 +101,15 @@ const keysPageHTML = `<!DOCTYPE html>
       <span class="hint" id="checkStatus"></span>
     </div>
     <div class="msg" id="listMsg"></div>
+    <div class="hint" style="margin-top:.5rem;">Chọn radio ở cột Gateway để đặt tài khoản dùng cho giao diện claude.ai tại cổng local. Để trống (không chọn) = tự chọn tài khoản có cookie.</div>
   </div>
 
   <div class="card">
-    <h2>Gateway claude.ai sử dụng key</h2>
-    <div class="gw-row">
-      <select id="gatewayKeySelect"><option value="">— Tự chọn (ưu tiên key còn hạn mức) —</option></select>
-      <button onclick="saveGatewayKey()">Lưu</button>
-    </div>
-    <div class="msg" id="gwMsg"></div>
-    <div class="hint">Key được chọn sẽ dùng cho giao diện claude.ai tại cổng local. Nếu để trống, gateway tự xoay sang key còn hạn mức.</div>
-  </div>
-
-  <div class="card">
-    <h2>Thêm key mới</h2>
-    <input type="text" id="newKey" placeholder="sk-ant-sid02-... (có thể dán nhiều key cách nhau bằng dấu phẩy)" autocomplete="off">
-    <button class="btn-primary" onclick="addKey()">Thêm vào pool</button>
+    <h2>Thêm tài khoản (dán cookie)</h2>
+    <textarea id="newCookie" placeholder='Dán JSON mảng cookie (EditThisCookie/Cookie-Editor export) tại đây' autocomplete="off"></textarea>
+    <button class="btn-primary" onclick="addAccount()">Thêm vào pool</button>
     <div class="msg" id="addMsg"></div>
-    <div class="hint">Key được lưu ngay vào file .env và áp dụng tức thì, không cần khởi động lại server.</div>
+    <div class="hint">Cookie được lưu vào <code>accounts.json</code> và áp dụng tức thì. Tên acc tự lấy từ claude.ai.</div>
   </div>
 </div>
 
@@ -141,6 +133,12 @@ function statusBadge(k) {
   return '<span class="badge limited" style="background:rgba(139,144,163,.15); color:var(--muted);">Chưa kiểm tra</span>';
 }
 
+function label(k) {
+  return k.displayName || k.masked || k.full.slice(0, 24) + '...';
+}
+
+let gatewayKey = '';
+
 async function loadKeys() {
   const res = await fetch('/keys/api', { headers });
   if (res.status === 401) {
@@ -153,79 +151,65 @@ async function loadKeys() {
   tbody.innerHTML = '';
   for (const k of data.keys) {
     const tr = document.createElement('tr');
+    const checked = k.full === gatewayKey ? ' checked' : '';
     tr.innerHTML =
-      '<td><code>' + escapeHtml(k.full) + '</code></td>' +
+      '<td><code>' + escapeHtml(label(k)) + '</code></td>' +
       '<td>' + statusBadge(k) + '</td>' +
+      '<td style="text-align:center;"><input type="radio" name="gw" value="' + escapeHtml(k.full) + '"' + checked + ' onchange="saveGatewayKey(this.value)"></td>' +
       '<td style="text-align:right; white-space:nowrap;">' +
         '<button class="btn-danger" style="margin-right:.4rem;" onclick="checkKeys(\'' + escapeHtml(k.full) + '\')">Kiểm tra</button>' +
-        '<button class="btn-danger" onclick="deleteKey(\'' + escapeHtml(k.full) + '\')">Xóa</button>' +
+        '<button class="btn-danger" onclick="deleteAccount(\'' + escapeHtml(k.full) + '\')">Xóa</button>' +
       '</td>';
     tbody.appendChild(tr);
   }
 
-  // refresh gateway dropdown only when the key list changed, so an
-  // in-progress selection is not wiped by the periodic refresh
+  // keep the gateway selection in sync with the server once on load
   const gwRes = await fetch('/keys/api/gateway', { headers });
   if (gwRes.ok) {
     const gwData = await gwRes.json();
-    const sel = document.getElementById('gatewayKeySelect');
-    const signature = data.keys.map(k => k.full).join('|');
-    const userPicked = sel.dataset.userPicked === '1' && [...sel.options].some(o => o.value === sel.value);
-    if (sel.dataset.signature !== signature) {
-      const current = gwData.gatewayKey || '';
-      sel.innerHTML = '<option value="">— Tự chọn (ưu tiên key còn hạn mức) —</option>';
-      for (const k of data.keys) {
-        const opt = document.createElement('option');
-        opt.value = k.full;
-        opt.textContent = k.full.slice(0, 28) + '...' + k.full.slice(-7);
-        if (k.full === current) opt.selected = true;
-        sel.appendChild(opt);
-      }
-      sel.dataset.signature = signature;
-    }
-    void userPicked;
+    if (!gatewayKey) gatewayKey = gwData.gatewayKey || '';
+    const radio = document.querySelector('input[name="gw"][value="' + cssEscape(gatewayKey) + '"]');
+    if (radio) radio.checked = true;
   }
 }
 
-document.addEventListener('change', e => {
-  if (e.target && e.target.id === 'gatewayKeySelect') {
-    e.target.dataset.userPicked = '1';
-  }
-});
+function cssEscape(s) { return s.replace(/"/g, '\\"'); }
 
-async function saveGatewayKey() {
-  const msg = document.getElementById('gwMsg');
-  const key = document.getElementById('gatewayKeySelect').value;
+async function saveGatewayKey(key) {
+  gatewayKey = key || '';
   const res = await fetch('/keys/api/gateway', {
     method: 'POST', headers,
-    body: JSON.stringify({ key })
+    body: JSON.stringify({ key: gatewayKey })
   });
   const data = await res.json();
+  const msg = document.getElementById('listMsg');
   msg.textContent = data.message || data.error;
   msg.className = res.ok ? 'msg success' : 'msg error';
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-async function addKey() {
-  const key = document.getElementById('newKey').value.trim();
+async function addAccount() {
+  const cookie = document.getElementById('newCookie').value.trim();
   const msg = document.getElementById('addMsg');
-  if (!key) { msg.textContent = 'Nhập key trước'; msg.className = 'msg error'; return; }
+  if (!cookie) { msg.textContent = 'Dán JSON cookie trước'; msg.className = 'msg error'; return; }
   const res = await fetch('/keys/api/add', {
     method: 'POST', headers,
-    body: JSON.stringify({ key })
+    body: JSON.stringify({ cookie })
   });
   const data = await res.json();
   msg.textContent = data.message || data.error;
   msg.className = res.ok ? 'msg success' : 'msg error';
-  if (res.ok) document.getElementById('newKey').value = '';
+  if (res.ok) {
+    document.getElementById('newCookie').value = '';
+  }
   loadKeys();
 }
 
-async function deleteKey(key) {
-  if (!confirm('Xóa key này khỏi pool?')) return;
+async function deleteAccount(key) {
+  if (!confirm('Xoá tài khoản này khỏi pool?')) return;
   const msg = document.getElementById('listMsg');
   const res = await fetch('/keys/api/delete', {
     method: 'POST', headers,
@@ -243,7 +227,7 @@ async function checkKeys(key) {
   const btn = document.getElementById('checkBtn');
   btn.disabled = true;
   btn.style.opacity = '.5';
-  statusEl.textContent = key ? 'Đang kiểm tra key...' : 'Đang kiểm tra tất cả keys (có thể mất vài giây)...';
+  statusEl.textContent = key ? 'Đang kiểm tra tài khoản...' : 'Đang kiểm tra tất cả (có thể mất vài giây)...';
   try {
     const res = await fetch('/keys/api/check', {
       method: 'POST', headers,
@@ -277,7 +261,7 @@ setInterval(loadKeys, 15000);
 </body>
 </html>`
 
-// KeysPageHandler serves the key management UI
+// KeysPageHandler serves the account/cookie management UI
 func KeysPageHandler(c *gin.Context) {
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(keysPageHTML))
 }

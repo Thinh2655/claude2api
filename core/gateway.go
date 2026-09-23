@@ -68,21 +68,30 @@ func NewGatewayHandler() http.Handler {
 	return h
 }
 
-// pickSessionKey prefers the user-selected gateway key, then falls back to
-// the first session in the pool.
-func pickSessionKey() string {
+// pickSession picks the session for gateway upstream requests. Order:
+// (1) the explicit GATEWAY_KEY the user selected (always honored, cookie or not);
+// (2) the first session that carries a full browser cookie file, so the
+// proxied web UI reaches claude.ai with the same cookie state the real browser
+// uses when no account is pinned;
+// (3) the first pool session.
+func pickSession() config.SessionInfo {
 	sessions := config.ConfigInstance.Sessions
 	if len(sessions) == 0 {
-		return ""
+		return config.SessionInfo{}
 	}
-	if preferred := config.ConfigInstance.GetGatewayKey(); preferred != "" {
+	if gw := config.ConfigInstance.GetGatewayKey(); gw != "" {
 		for i := range sessions {
-			if sessions[i].SessionKey == preferred {
-				return preferred
+			if sessions[i].SessionKey == gw {
+				return sessions[i]
 			}
 		}
 	}
-	return sessions[0].SessionKey
+	for i := range sessions {
+		if sessions[i].ExtraCookie != "" {
+			return sessions[i]
+		}
+	}
+	return sessions[0]
 }
 
 // chromeCommonHeaders are what ImpersonateChrome would set. The gateway
@@ -140,14 +149,34 @@ func gatewayRewriteRequest(req *http.Request) {
 			}
 		}
 	}
-	if sessionKey == "" {
-		sessionKey = pickSessionKey()
+	var session config.SessionInfo
+	if sessionKey != "" {
+		for i := range config.ConfigInstance.Sessions {
+			if config.ConfigInstance.Sessions[i].SessionKey == sessionKey {
+				session = config.ConfigInstance.Sessions[i]
+				break
+			}
+		}
+	}
+	if session.SessionKey == "" {
+		session = pickSession()
 	}
 
-	// Rebuild the cookie header: drop our local token cookie and any upstream
-	// cookies - claude.ai only needs the sessionKey
-	cookies := []string{fmt.Sprintf("sessionKey=%s", sessionKey)}
-	req.Header.Set("Cookie", strings.Join(cookies, "; "))
+	// Forward the same browser cookie state the client path uses: start from
+	// the full cookie file header (cf_bm, routingHint, …) when the session has
+	// one, then ensure sessionKey is present.
+	cookie := session.ExtraCookie
+	if !strings.Contains(cookie, "sessionKey=") {
+		cookie = strings.TrimSpace(cookie)
+		if cookie != "" {
+			cookie += "; "
+		}
+		cookie += "sessionKey=" + session.SessionKey
+	}
+	req.Header.Set("Cookie", cookie)
+	if session.DeviceID != "" {
+		req.Header.Set("anthropic-device-id", session.DeviceID)
+	}
 	req.Header.Set("Origin", claudeBaseURL)
 	req.Header.Set("Referer", claudeBaseURL+"/")
 

@@ -26,27 +26,12 @@ func HealthCheckHandler(c *gin.Context) {
 }
 
 func MoudlesHandler(c *gin.Context) {
-	models := []map[string]interface{}{
-		{"id": "claude-sonnet-4-6"},
-		{"id": "claude-haiku-4-5-20251001"},
-		{"id": "claude-sonnet-5"},
+	ids := core.ModelIDs()
+	data := make([]map[string]interface{}, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, map[string]interface{}{"id": id})
 	}
-
-	extendedModels := make([]map[string]interface{}, 0, len(models)*2)
-	for _, m := range models {
-		// 保留原有 id
-		extendedModels = append(extendedModels, m)
-		// 追加 -think 版本
-		if id, ok := m["id"].(string); ok {
-			extendedModels = append(extendedModels, map[string]interface{}{
-				"id": id + "-think",
-			})
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"data": extendedModels,
-	})
+	c.JSON(http.StatusOK, gin.H{"data": data})
 }
 
 // claude.ai retired the old model IDs; requests with them fail with 400
@@ -95,22 +80,38 @@ func ChatCompletionsHandler(c *gin.Context) {
 
 	// Get model or use default
 	model := getModelOrDefault(req.Model)
+	// Echo the resolved model id back in the response instead of a hardcoded
+	// one, so OpenAI clients see the model they asked for.
+	c.Set("RequestedModel", model)
 	index := config.Sr.NextIndex()
 	// Attempt with retry mechanism - no local cooldown bookkeeping: a 429
-	// just moves to the next session immediately
+	// just moves to the next session immediately.
+	// Remember the last upstream status so that if every session fails the
+	// underlying cause (e.g. a rate limit) is reported to the client instead
+	// of a generic 500.
+	var lastStatus int
 	for i := 0; i < config.ConfigInstance.RetryCount; i++ {
 		index = (index + 1) % len(config.ConfigInstance.Sessions)
 		session, err := config.ConfigInstance.GetSessionForModel(index)
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to get session for model %s: %v", model, err))
 			logger.Info("Retrying another session")
+			lastStatus = http.StatusServiceUnavailable
 			continue
 		}
 
-		logger.Info(fmt.Sprintf("Using session for model %s: %s", model, session.SessionKey))
+		label := session.DisplayName
+		if label == "" {
+			label = maskKey(session.SessionKey)
+		}
+		logger.Info(fmt.Sprintf("Using account for model %s: %s", model, label))
 		// Initialize client and process request
-		if handleChatRequest(c, session, model, processor, req.Stream) {
+		st, ok := handleChatRequest(c, session, model, processor, req.Stream)
+		if ok {
 			return // Success, exit the retry loop
+		}
+		if st != 0 {
+			lastStatus = st
 		}
 
 		// Client disconnected - no point in retrying
@@ -126,8 +127,13 @@ func ChatCompletionsHandler(c *gin.Context) {
 	}
 
 	logger.Error("Failed for all retries")
-	c.JSON(http.StatusInternalServerError, ErrorResponse{
-		Error: "Failed to process request after multiple attempts"})
+	finalStatus := http.StatusInternalServerError
+	finalMsg := "Failed to process request after multiple attempts"
+	if lastStatus != 0 && lastStatus != http.StatusOK {
+		finalStatus = lastStatus
+		finalMsg = "Upstream claude.ai is unavailable: " + http.StatusText(lastStatus)
+	}
+	c.JSON(finalStatus, ErrorResponse{Error: finalMsg})
 }
 
 func MirrorChatHandler(c *gin.Context) {
@@ -154,6 +160,10 @@ func MirrorChatHandler(c *gin.Context) {
 	// Get model or use default
 	model := getModelOrDefault(req.Model)
 
+	// Echo the resolved model id back in the response instead of a hardcoded
+	// one, so OpenAI clients see the model they asked for.
+	c.Set("RequestedModel", model)
+
 	// Extract session info from auth header
 	session, err := extractSessionFromAuthHeader(c)
 	if err != nil {
@@ -164,9 +174,15 @@ func MirrorChatHandler(c *gin.Context) {
 	}
 
 	// Process the request with the provided session
-	if !handleChatRequest(c, session, model, processor, req.Stream) {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Error: "Failed to process request",
+	if status, ok := handleChatRequest(c, session, model, processor, req.Stream); !ok {
+		finalStatus := status
+		finalMsg := "Failed to process request"
+		if finalStatus != 0 && finalStatus != http.StatusOK {
+			finalStatus = status
+			finalMsg = "Upstream claude.ai is unavailable: " + http.StatusText(status)
+		}
+		c.JSON(finalStatus, ErrorResponse{
+			Error: finalMsg,
 		})
 		return
 	}
@@ -196,7 +212,7 @@ func parseAndValidateRequest(c *gin.Context) (*model.ChatCompletionRequest, erro
 
 func getModelOrDefault(model string) string {
 	if model == "" {
-		return "claude-sonnet-4-6"
+		return "claude-sonnet-5"
 	}
 	return resolveModel(model)
 }
@@ -217,19 +233,23 @@ func extractSessionFromAuthHeader(c *gin.Context) (*config.SessionInfo, error) {
 	return config.NewSessionInfo(authInfo, ""), nil
 }
 
-func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) bool {
+func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) (int, bool) {
 	session.Lock()
 	defer session.Unlock()
 
+	fail := func(status int) (int, bool) {
+		return status, false
+	}
+
 	// Initialize the Claude client
-	claudeClient := core.NewClient(session.SessionKey, config.ConfigInstance.Proxy, model)
+	claudeClient := core.NewClientWithCookie(session.SessionKey, config.ConfigInstance.Proxy, model, session.ExtraCookie, session.DeviceID)
 
 	// Get org ID if not already set
 	if session.OrgID == "" {
 		orgId, err := claudeClient.GetOrgID()
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to get org ID: %v", err))
-			return false
+			return fail(http.StatusServiceUnavailable)
 		}
 		session.OrgID = orgId
 		config.ConfigInstance.SetSessionOrgID(session.SessionKey, session.OrgID)
@@ -242,7 +262,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		err := claudeClient.UploadFile(processor.ImgDataList)
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to upload file: %v", err))
-			return false
+			return fail(http.StatusServiceUnavailable)
 		}
 	}
 
@@ -259,10 +279,10 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	_, statusCode, err := claudeClient.SendMessageWithCreate(processor.Prompt.String(), stream, c)
 	if err != nil {
 		logger.Error(fmt.Sprintf("Failed to send message: %v", err))
-		return false
+		return fail(statusCode)
 	}
 	if statusCode != http.StatusOK {
-		return false
+		return fail(statusCode)
 	}
 
 	// Clean up conversation if enabled
@@ -270,7 +290,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		go cleanupConversation(claudeClient, conversationID, 3)
 	}
 
-	return true
+	return statusCode, true
 }
 
 func cleanupConversation(client *core.Client, conversationID string, retry int) {

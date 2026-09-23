@@ -2,6 +2,7 @@ package config
 
 import (
 	"claude2api/logger"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -18,6 +19,19 @@ import (
 type SessionInfo struct {
 	SessionKey string `yaml:"sessionKey"`
 	OrgID      string `yaml:"orgID"`
+	// DisplayName is an optional human label for the account (e.g. an email),
+	// shown in the UI instead of the raw session key.
+	DisplayName string `yaml:"displayName,omitempty"`
+	// ExtraCookie is the full browser Cookie header (cf_bm, routingHint, …)
+	// attached to upstream requests alongside sessionKey. Loaded from a cookie
+	// file/account when present.
+	ExtraCookie string `yaml:"extraCookie,omitempty"`
+	// CookieJSON keeps the raw cookie array (for re-export to accounts.json).
+	// Not serialized by config loaders.
+	CookieJSON []CookieFile `yaml:"-" json:"-"`
+	// DeviceID mirrors the browser anthropic-device-id cookie when using a
+	// cookie file, so upstream sees the same device as the real browser.
+	DeviceID string `yaml:"deviceId,omitempty"`
 	// mu serializes requests on one session: concurrent requests would
 	// otherwise overwrite each other's paprika_mode (think mode) settings.
 	// Pointer so that SessionInfo copies share the same lock.
@@ -36,6 +50,16 @@ func (s *SessionInfo) Unlock() {
 // that are not loaded from config (e.g. extracted from request headers)
 func NewSessionInfo(sessionKey, orgID string) *SessionInfo {
 	return &SessionInfo{SessionKey: sessionKey, OrgID: orgID, mu: &sync.Mutex{}}
+}
+
+// NewSessionInfoWithCookie is NewSessionInfo with an optional Cookie header,
+// device id and display name, for sessions configured from a full browser cookie.
+func NewSessionInfoWithCookie(sessionKey, orgID, displayName, extraCookie, deviceID string) *SessionInfo {
+	s := NewSessionInfo(sessionKey, orgID)
+	s.DisplayName = displayName
+	s.ExtraCookie = extraCookie
+	s.DeviceID = deviceID
+	return s
 }
 
 type SessionRagen struct {
@@ -60,7 +84,7 @@ type Config struct {
 	RwMutx                 sync.RWMutex  `yaml:"-"`             // 不从YAML加载
 }
 
-// 解析 SESSION 格式的环境变量
+// 解析 SESSIONS 格式的环境变量
 func parseSessionEnv(envValue string) (int, []SessionInfo) {
 	if envValue == "" {
 		return 0, []SessionInfo{}
@@ -78,8 +102,7 @@ func parseSessionEnv(envValue string) (int, []SessionInfo) {
 		if len(parts) > 1 {
 			orgID = parts[1]
 		}
-
-		sessions = append(sessions, *NewSessionInfo(parts[0], orgID))
+		sessions = append(sessions, *NewSessionInfoWithCookie(parts[0], orgID, "", "", ""))
 	}
 	if retryCount > 5 {
 		retryCount = 5 // 限制最大重试次数为 5 次
@@ -137,6 +160,24 @@ func (c *Config) RemoveSession(sessionKey string) bool {
 	return false
 }
 
+// AddSessionFromCookies builds a SessionInfo from a cookie array and appends
+// it to the pool if the underlying sessionKey is not already present.
+func (c *Config) AddSessionFromCookies(name string, cookies []CookieFile) (SessionInfo, bool) {
+	s, ok := buildSessionFromCookies(name, cookies)
+	if !ok {
+		return SessionInfo{}, false
+	}
+	c.RwMutx.Lock()
+	defer c.RwMutx.Unlock()
+	for i := range c.Sessions {
+		if c.Sessions[i].SessionKey == s.SessionKey {
+			return SessionInfo{}, false
+		}
+	}
+	c.Sessions = append(c.Sessions, s)
+	return s, true
+}
+
 func (c *Config) SetSessionOrgID(sessionKey, orgID string) {
 	c.RwMutx.Lock()
 	defer c.RwMutx.Unlock()
@@ -144,6 +185,19 @@ func (c *Config) SetSessionOrgID(sessionKey, orgID string) {
 		if c.Sessions[i].SessionKey == sessionKey {
 			logger.Info(fmt.Sprintf("Setting OrgID for session %s to %s", sessionKey, orgID))
 			c.Sessions[i].OrgID = orgID
+			return
+		}
+	}
+}
+
+// SetSessionDisplayName labels a session with the account email (or any human
+// label). Used to auto-populate the UI name from /api/account.
+func (c *Config) SetSessionDisplayName(sessionKey, name string) {
+	c.RwMutx.Lock()
+	defer c.RwMutx.Unlock()
+	for i := range c.Sessions {
+		if c.Sessions[i].SessionKey == sessionKey {
+			c.Sessions[i].DisplayName = name
 			return
 		}
 	}
@@ -209,13 +263,123 @@ func loadConfigFromYAML(configPath string) (*Config, error) {
 	return &config, nil
 }
 
+// CookieFile holds one entry of a browser-export cookie.json (EditThisCookie /
+// Cookie-Editor format).
+type CookieFile struct {
+	Domain         string  `json:"domain"`
+	Name           string  `json:"name"`
+	Value          string  `json:"value"`
+	ExpirationDate float64 `json:"expirationDate"`
+	HostOnly       bool    `json:"hostOnly"`
+	SessionCookie  bool    `json:"session"`
+	HttpOnly       bool    `json:"httpOnly"`
+	Secure         bool    `json:"secure"`
+	Path           string  `json:"path"`
+}
+
+// buildSessionFromCookies converts a browser cookie array (EditThisCookie /
+// Cookie-Editor format) into a SessionInfo: sessionKey from the sessionKey
+// cookie, DeviceID from anthropic-device-id, org from lastActiveOrg, and the
+// full claude.ai cookie list as the Cookie header so upstream requests carry
+// the same browser state. Missing sessionKey → not ok.
+func buildSessionFromCookies(displayName string, cookies []CookieFile) (SessionInfo, bool) {
+	var sessionKey, deviceID, orgID string
+	var pairs []string
+	for _, c := range cookies {
+		if !strings.Contains(c.Domain, "claude.ai") {
+			continue
+		}
+		switch c.Name {
+		case "sessionKey", "sessionKeyV3":
+			if sessionKey == "" && c.Value != "" {
+				sessionKey = c.Value
+			}
+		case "anthropic-device-id":
+			deviceID = c.Value
+		case "lastActiveOrg":
+			orgID = c.Value
+		}
+		pairs = append(pairs, c.Name+"="+c.Value)
+	}
+	if sessionKey == "" {
+		return SessionInfo{}, false
+	}
+	s := NewSessionInfoWithCookie(sessionKey, orgID, displayName, strings.Join(pairs, "; "), deviceID)
+	s.CookieJSON = cookies
+	return *s, true
+}
+
+// LoadSessionFromCookie reads a single cookie file (every ".claude.ai" cookie)
+// and returns one SessionInfo. Kept for compatibility with legacy cookie.json.
+func LoadSessionFromCookie(cookiePath string) (SessionInfo, bool) {
+	data, err := os.ReadFile(cookiePath)
+	if err != nil {
+		return SessionInfo{}, false
+	}
+	var cookies []CookieFile
+	if err := json.Unmarshal(data, &cookies); err != nil {
+		logger.Error(fmt.Sprintf("Failed to parse cookie file %s: %v", cookiePath, err))
+		return SessionInfo{}, false
+	}
+	return buildSessionFromCookies("", cookies)
+}
+
+// CookieAccount is one cookie-account stored in accounts.json: an optional
+// display name plus the exported browser cookie array.
+type CookieAccount struct {
+	Name    string       `json:"name,omitempty"`
+	Cookies []CookieFile `json:"cookies"`
+}
+
+// LoadCookieAccounts reads accounts.json (array of CookieAccount) and the
+// legacy cookie.json (single account), building the full cookie pool. Returns
+// the accounts plus the legacy session if present.
+func LoadCookieAccounts(accountsPath string) ([]SessionInfo, bool) {
+	// Legacy single cookie.json.
+	var out []SessionInfo
+	var ok bool
+	if s, ok2 := LoadSessionFromCookie("cookie.json"); ok2 {
+		out = append(out, s)
+		ok = true
+	}
+	// accounts.json: array of named accounts.
+	data, err := os.ReadFile(accountsPath)
+	if err != nil {
+		return out, ok
+	}
+	var accounts []CookieAccount
+	if err := json.Unmarshal(data, &accounts); err != nil {
+		logger.Error(fmt.Sprintf("Failed to parse %s: %v", accountsPath, err))
+		return out, ok
+	}
+	for _, a := range accounts {
+		if len(a.Cookies) == 0 {
+			continue
+		}
+		if s, ok2 := buildSessionFromCookies(a.Name, a.Cookies); ok2 {
+			out = append(out, s)
+			ok = true
+		}
+	}
+	return out, ok
+}
+
 // 从环境变量加载配置
 func loadConfigFromEnv() *Config {
 	maxChatHistoryLength, err := strconv.Atoi(os.Getenv("MAX_CHAT_HISTORY_LENGTH"))
 	if err != nil {
 		maxChatHistoryLength = 10000 // 默认值
 	}
-	retryCount, sessions := parseSessionEnv(os.Getenv("SESSIONS"))
+	// Cookie accounts are now the source of truth. Load accounts.json (named
+	// accounts) + legacy cookie.json; fall back to the SESSIONS env var only
+	// when no cookie account is configured.
+	sessions, haveCookie := LoadCookieAccounts("accounts.json")
+	retryCount := len(sessions)
+	if !haveCookie {
+		envRetry, envSessions := parseSessionEnv(os.Getenv("SESSIONS"))
+		retryCount = envRetry
+		sessions = envSessions
+	}
 	config := &Config{
 		// 解析 SESSIONS 环境变量
 		Sessions: sessions,

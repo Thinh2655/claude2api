@@ -3,7 +3,9 @@ package service
 import (
 	"bufio"
 	"claude2api/config"
+	"claude2api/core"
 	"claude2api/logger"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,9 +15,11 @@ import (
 )
 
 type keyInfo struct {
-	Masked   string `json:"masked"`
-	Full     string `json:"full,omitempty"`
-	HasOrgID bool   `json:"hasOrgID"`
+	Masked      string `json:"masked"`
+	Full        string `json:"full,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
+	HasCookie   bool   `json:"hasCookie"`
+	HasOrgID    bool   `json:"hasOrgID"`
 }
 
 type keysResponse struct {
@@ -30,7 +34,17 @@ func maskKey(key string) string {
 	return key[:20] + "..." + key[len(key)-7:]
 }
 
-// KeysListHandler returns all configured sessions with masked keys
+// displayLabel returns the account display name, or the masked key when the
+// account has no human-readable label.
+func displayLabel(s *config.SessionInfo) string {
+	if s.DisplayName != "" {
+		return s.DisplayName
+	}
+	return maskKey(s.SessionKey)
+}
+
+// KeysListHandler returns all configured accounts (cookie-based) with a
+// display label (account name if set, otherwise a masked key)
 func KeysListHandler(c *gin.Context) {
 	config.ConfigInstance.RwMutx.RLock()
 	defer config.ConfigInstance.RwMutx.RUnlock()
@@ -39,50 +53,62 @@ func KeysListHandler(c *gin.Context) {
 	for i := range config.ConfigInstance.Sessions {
 		s := &config.ConfigInstance.Sessions[i]
 		resp.Keys = append(resp.Keys, keyInfo{
-			Masked:   maskKey(s.SessionKey),
-			Full:     s.SessionKey,
-			HasOrgID: s.OrgID != "",
+			Masked:      maskKey(s.SessionKey),
+			Full:        s.SessionKey,
+			DisplayName: s.DisplayName,
+			HasCookie:   s.ExtraCookie != "",
+			HasOrgID:    s.OrgID != "",
 		})
 	}
 	c.JSON(http.StatusOK, resp)
 }
 
-// KeyAddHandler adds one or more new session keys (comma-separated in body)
+// KeyAddHandler adds a new cookie account from a pasted cookie JSON array.
+// Body: {"name": "<optional display name>", "cookie": "<JSON array of cookies>"}
 func KeyAddHandler(c *gin.Context) {
 	var body struct {
-		Key string `json:"key"`
+		Name   string `json:"name"`
+		Cookie string `json:"cookie"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Key) == "" {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"key\": \"sk-ant-sid02-...\"}"})
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"cookie\": \"[...JSON...]\"}"})
+		return
+	}
+	if strings.TrimSpace(body.Cookie) == "" {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide cookie JSON array"})
 		return
 	}
 
-	added := 0
-	for _, part := range strings.Split(body.Key, ",") {
-		key := strings.TrimSpace(strings.Trim(part, `"`))
-		if key == "" {
-			continue
-		}
-		if !strings.HasPrefix(key, "sk-ant-sid") {
-			c.JSON(http.StatusBadRequest, ErrorResponse{
-				Error: fmt.Sprintf("Invalid session key format: %s...", key[:min(20, len(key))])})
-			return
-		}
-		if config.ConfigInstance.AddSession(key) {
-			added++
-		}
-	}
-	if added == 0 {
-		c.JSON(http.StatusOK, gin.H{"message": "No new keys added (duplicate)"})
+	var cookies []config.CookieFile
+	if err := json.Unmarshal([]byte(body.Cookie), &cookies); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("Invalid cookie JSON: %v", err)})
 		return
 	}
-	if err := saveSessionsToEnv(); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist sessions to .env: %v", err))
+
+	s, ok := config.ConfigInstance.AddSessionFromCookies(strings.TrimSpace(body.Name), cookies)
+	if !ok {
+		c.JSON(http.StatusOK, gin.H{"message": "No new account added (missing sessionKey or duplicate)"})
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Added %d key(s)", added)})
+	// No explicit label? Fetch the account email from claude.ai and use it as
+	// the display name so the UI shows a human label.
+	if s.DisplayName == "" {
+		if email := resolveAccountEmail(&s); email != "" {
+			config.ConfigInstance.SetSessionDisplayName(s.SessionKey, email)
+			s.DisplayName = email
+		}
+	}
+	if err := persistCookieAccounts(); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist accounts: %v", err))
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Added account " + displayLabel(&s),
+		"key":     s.SessionKey,
+	})
 }
 
-// KeyDeleteHandler removes a session by full key
+// KeyDeleteHandler removes an account by full session key
 func KeyDeleteHandler(c *gin.Context) {
 	var body struct {
 		Key string `json:"key"`
@@ -92,17 +118,17 @@ func KeyDeleteHandler(c *gin.Context) {
 		return
 	}
 	if len(config.ConfigInstance.Sessions) <= 1 {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Cannot delete the last remaining key"})
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Cannot delete the last remaining account"})
 		return
 	}
 	if !config.ConfigInstance.RemoveSession(strings.TrimSpace(body.Key)) {
-		c.JSON(http.StatusNotFound, ErrorResponse{Error: "Key not found"})
+		c.JSON(http.StatusNotFound, ErrorResponse{Error: "Account not found"})
 		return
 	}
-	if err := saveSessionsToEnv(); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist sessions to .env: %v", err))
+	if err := persistCookieAccounts(); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist accounts: %v", err))
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "Key deleted"})
+	c.JSON(http.StatusOK, gin.H{"message": "Account deleted"})
 }
 
 // GatewayKeyGetHandler returns the currently selected gateway key
@@ -149,21 +175,45 @@ func min(a, b int) int {
 	return b
 }
 
-// saveSessionsToEnv rewrites only the SESSIONS line in .env, preserving other lines.
-func saveSessionsToEnv() error {
+// persistCookieAccounts serializes the current account pool (the cookie array
+// + display name of each session) back to accounts.json. Sessions without a
+// cookie array (e.g. env fallback) are skipped.
+func persistCookieAccounts() error {
 	config.ConfigInstance.RwMutx.RLock()
-	keys := make([]string, 0, len(config.ConfigInstance.Sessions))
+	accounts := make([]config.CookieAccount, 0, len(config.ConfigInstance.Sessions))
 	for i := range config.ConfigInstance.Sessions {
-		k := config.ConfigInstance.Sessions[i].SessionKey
-		line := k
-		if org := config.ConfigInstance.Sessions[i].OrgID; org != "" {
-			line = k + ":" + org
+		s := &config.ConfigInstance.Sessions[i]
+		if len(s.CookieJSON) == 0 {
+			continue
 		}
-		keys = append(keys, line)
+		accounts = append(accounts, config.CookieAccount{
+			Name:    s.DisplayName,
+			Cookies: s.CookieJSON,
+		})
 	}
 	config.ConfigInstance.RwMutx.RUnlock()
 
-	return saveEnvLine("SESSIONS", strings.Join(keys, ","))
+	if len(accounts) == 0 {
+		return nil
+	}
+	data, err := json.MarshalIndent(accounts, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile("accounts.json", data, 0o600)
+}
+
+// resolveAccountEmail builds a browser-fingerprinted client for the session's
+// cookie and asks claude.ai for the account email. Returns "" on any failure;
+// callers use it only as a best-effort display label.
+func resolveAccountEmail(s *config.SessionInfo) string {
+	client := core.NewClientWithCookie(s.SessionKey, config.ConfigInstance.Proxy, "", s.ExtraCookie, s.DeviceID)
+	email, err := client.GetAccountEmail()
+	if err != nil {
+		logger.Error(fmt.Sprintf("Failed to resolve account email: %v", err))
+		return ""
+	}
+	return email
 }
 
 // saveEnvLine rewrites a single KEY=value line in .env (creates the file if missing).
