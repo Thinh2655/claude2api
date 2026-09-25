@@ -111,6 +111,16 @@ const keysPageHTML = `<!DOCTYPE html>
     <div class="msg" id="addMsg"></div>
     <div class="hint">Cookie được lưu vào <code>accounts.json</code> và áp dụng tức thì. Tên acc tự lấy từ claude.ai.</div>
   </div>
+
+  <div class="card">
+    <h2>5 request mới nhất</h2>
+    <table id="recentTable">
+      <thead><tr><th>Thời gian</th><th>Tài khoản</th><th>Model</th><th style="text-align:right;">In ↑</th><th style="text-align:right;">Out ↓</th><th>Kết quả</th><th>Nội dung</th></tr></thead>
+      <tbody id="recentBody">
+        <tr><td colspan="7" style="color:var(--muted);">Chưa có request nào</td></tr>
+      </tbody>
+    </table>
+  </div>
 </div>
 
 <script>
@@ -175,6 +185,8 @@ async function loadKeys() {
 
 function cssEscape(s) { return s.replace(/"/g, '\\"'); }
 
+function fmt(n) { return String(n || 0).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+
 async function saveGatewayKey(key) {
   gatewayKey = key || '';
   const res = await fetch('/keys/api/gateway', {
@@ -222,6 +234,34 @@ async function deleteAccount(key) {
   loadKeys();
 }
 
+async function loadRecent() {
+  try {
+    const res = await fetch('/keys/api/recent', { headers });
+    if (!res.ok) return;
+    const data = await res.json();
+    const tbody = document.getElementById('recentBody');
+    const rows = (data.requests || []).map(function(r) {
+      const t = new Date(r.time);
+      const hh = String(t.getHours()).padStart(2, '0') + ':' +
+                 String(t.getMinutes()).padStart(2, '0') + ':' +
+                 String(t.getSeconds()).padStart(2, '0');
+      const badge = r.ok
+        ? '<span class="badge ok">' + r.status + '</span>'
+        : '<span class="badge limited" style="background:rgba(248,113,113,.15); color:var(--err);">' + r.status + '</span>';
+      return '<tr><td style="white-space:nowrap;">' + hh + '</td>' +
+        '<td><code>' + escapeHtml(r.account) + '</code></td>' +
+        '<td><code>' + escapeHtml(r.model) + '</code></td>' +
+        '<td style="text-align:right; white-space:nowrap;">' + fmt(r.promptTokens) + ' <span style="color:var(--ok);">↑</span></td>' +
+        '<td style="text-align:right; white-space:nowrap;">' + fmt(r.completionTokens) + ' <span style="color:var(--accent);">↓</span></td>' +
+        '<td>' + badge + (r.ms ? ' <span style="color:var(--muted);">' + r.ms + 'ms</span>' : '') + '</td>' +
+        '<td style="color:var(--muted);">' + escapeHtml(r.preview) + '</td></tr>';
+    });
+    tbody.innerHTML = rows.length
+      ? rows.join('')
+      : '<tr><td colspan="7" style="color:var(--muted);">Chưa có request nào</td></tr>';
+  } catch (e) { /* dashboard keeps working when the endpoint is unreachable */ }
+}
+
 async function checkKeys(key) {
   const statusEl = document.getElementById('checkStatus');
   const btn = document.getElementById('checkBtn');
@@ -256,7 +296,9 @@ async function checkKeys(key) {
 }
 
 loadKeys();
+loadRecent();
 setInterval(loadKeys, 15000);
+setInterval(loadRecent, 5000);
 </script>
 </body>
 </html>`

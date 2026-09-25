@@ -2,6 +2,7 @@ package model
 
 import (
 	"claude2api/logger"
+	"claude2api/utils"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -118,6 +119,11 @@ func streamRespose(text string, gc *gin.Context) error {
 }
 
 func noStreamResponse(text string, gc *gin.Context) error {
+	promptTokens := 0
+	if v, ok := gc.Get("PromptTokens"); ok {
+		promptTokens, _ = v.(int)
+	}
+	completionTokens := utils.EstimateCompletionTokens(text)
 	openAIResp := &OpenAIResponse{
 		ID:      uuid.New().String(),
 		Object:  "chat.completion",
@@ -134,7 +140,15 @@ func noStreamResponse(text string, gc *gin.Context) error {
 				FinishReason: "stop",
 			},
 		},
+		Usage: Usage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
+		},
 	}
+
+	// The dashboard reads these after the response is flushed.
+	gc.Set("CompletionTokens", completionTokens)
 
 	gc.JSON(200, openAIResp)
 	return nil

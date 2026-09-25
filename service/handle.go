@@ -26,6 +26,16 @@ func HealthCheckHandler(c *gin.Context) {
 }
 
 func MoudlesHandler(c *gin.Context) {
+	// Prefer the live model list fetched from claude.ai; fall back to the
+	// built-in table when no session has been probed yet.
+	if ids, ok := core.BootstrapModelIDs(); ok {
+		data := make([]map[string]interface{}, 0, len(ids))
+		for _, id := range ids {
+			data = append(data, map[string]interface{}{"id": id})
+		}
+		c.JSON(http.StatusOK, gin.H{"data": data})
+		return
+	}
 	ids := core.ModelIDs()
 	data := make([]map[string]interface{}, 0, len(ids))
 	for _, id := range ids {
@@ -83,6 +93,9 @@ func ChatCompletionsHandler(c *gin.Context) {
 	// Echo the resolved model id back in the response instead of a hardcoded
 	// one, so OpenAI clients see the model they asked for.
 	c.Set("RequestedModel", model)
+	// Rough input size, so the OpenAI usage object and the dashboard are not
+	// all-zero: claude.ai never reports token counts.
+	c.Set("PromptTokens", utils.EstimatePromptTokens(processor.Prompt.String()))
 	index := config.Sr.NextIndex()
 	// Attempt with retry mechanism - no local cooldown bookkeeping: a 429
 	// just moves to the next session immediately.
@@ -163,6 +176,8 @@ func MirrorChatHandler(c *gin.Context) {
 	// Echo the resolved model id back in the response instead of a hardcoded
 	// one, so OpenAI clients see the model they asked for.
 	c.Set("RequestedModel", model)
+	// Rough input size for the usage object and dashboard (upstream reports none).
+	c.Set("PromptTokens", utils.EstimatePromptTokens(processor.Prompt.String()))
 
 	// Extract session info from auth header
 	session, err := extractSessionFromAuthHeader(c)
@@ -233,9 +248,16 @@ func extractSessionFromAuthHeader(c *gin.Context) (*config.SessionInfo, error) {
 	return config.NewSessionInfo(authInfo, ""), nil
 }
 
-func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) (int, bool) {
+func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) (status int, ok bool) {
+	start := time.Now()
 	session.Lock()
 	defer session.Unlock()
+
+	// Record this attempt in the dashboard's recent-request log no matter which
+	// path the function takes, so the list reflects failures too.
+	defer func() {
+		recordRecent(c, session, model, status, ok, time.Since(start), firstUserText(processor))
+	}()
 
 	fail := func(status int) (int, bool) {
 		return status, false

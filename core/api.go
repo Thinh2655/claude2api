@@ -4,8 +4,10 @@ import (
 	"bufio"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"claude2api/config"
 	"claude2api/logger"
 	"claude2api/model"
+	"claude2api/utils"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +17,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -115,6 +118,143 @@ var modelThinkingSpecs = []struct {
 		DefaultEffort: "low", Mode: "off", Type: "effort_and_mode",
 		Efforts: []string{"low", "medium", "high"},
 	}},
+}
+
+// BootstrapModel is one entry of claude_ai_bootstrap_models_config on
+// /api/bootstrap — the model list the web UI actually offers this account.
+type BootstrapModel struct {
+	Model       string                   `json:"model"`
+	Name        string                   `json:"name"`
+	Description string                   `json:"description"`
+	Inactive    bool                     `json:"inactive"`
+	Overflow    bool                     `json:"overflow"`
+	PaprikaModes []string                `json:"paprika_modes"`
+	ThinkingModes []map[string]interface{} `json:"thinking_modes"`
+	HardLimit   int                      `json:"hard_limit"`
+}
+
+// bootstrapModelsConfig holds the model list advertised by claude.ai, refreshed
+// in the background. It degrades to the built-in list when the fetch fails.
+var (
+	bootstrapModels     []BootstrapModel
+	bootstrapModelsAt   time.Time
+	bootstrapModelsLock sync.RWMutex
+)
+
+const bootstrapModelsTTL = 6 * time.Hour
+
+// modelThinkingFromBootstrap maps a web-ui model entry to the spec used to
+// parse "<base>[-effort][-think]" ids and build /v1/models. Only extended
+// thinking is exposed as a "-think" variant: no effort variants are derived
+// here, since the web no longer advertises a per-effort selector.
+func modelThinkingFromBootstrap(m BootstrapModel) (string, ModelThinkingSpec) {
+	spec := ModelThinkingSpec{Mode: "auto", Type: "mode"}
+	extended := false
+	for _, p := range m.PaprikaModes {
+		if p == "extended" {
+			extended = true
+		}
+	}
+	if !extended {
+		spec.Mode = "off"
+	}
+	return m.Model, spec
+}
+
+// FetchBootstrapModels asks claude.ai for the model list the account can
+// actually use (/api/bootstrap → claude_ai_bootstrap_models_config) and caches
+// it. Empty result means the fetch failed and the built-in list stays in force.
+func FetchBootstrapModels(sessionKey, cookie, deviceID string) []BootstrapModel {
+	bootstrapModelsLock.Lock()
+	defer bootstrapModelsLock.Unlock()
+
+	if time.Since(bootstrapModelsAt) < bootstrapModelsTTL && len(bootstrapModels) > 0 {
+		return bootstrapModels
+	}
+
+	cl := req.C().ImpersonateChrome().SetTLSFingerprint(tls.HelloChrome_133).SetTimeout(30 * time.Second)
+	if config.ConfigInstance.Proxy != "" {
+		cl.SetProxyURL(config.ConfigInstance.Proxy)
+	}
+	if cookie == "" {
+		cl.SetCommonCookies(
+			&http.Cookie{Name: "sessionKey", Value: sessionKey},
+			&http.Cookie{Name: "sessionKeyV3", Value: sessionKey},
+		)
+	} else {
+		cl.SetCommonHeader("Cookie", cookie)
+	}
+	if deviceID != "" {
+		cl.SetCommonHeader("anthropic-device-id", deviceID)
+	} else {
+		cl.SetCommonHeader("anthropic-device-id", stableDeviceID(sessionKey))
+	}
+
+	resp, err := cl.R().
+		SetHeader("referer", "https://claude.ai/new").
+		SetHeader("accept", "application/json").
+		Get("https://claude.ai/api/bootstrap")
+	if err != nil {
+		logger.Error(fmt.Sprintf("Failed to fetch bootstrap model list: %v", err))
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		logger.Error(fmt.Sprintf("Bootstrap fetch returned %d", resp.StatusCode))
+		return nil
+	}
+
+	var boot struct {
+		Account struct {
+			Memberships []struct {
+				Organization struct {
+					Models []BootstrapModel `json:"claude_ai_bootstrap_models_config"`
+				} `json:"organization"`
+			} `json:"memberships"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(resp.Bytes(), &boot); err != nil {
+		logger.Error(fmt.Sprintf("Failed to parse bootstrap response: %v", err))
+		return nil
+	}
+	var out []BootstrapModel
+	for _, m := range boot.Account.Memberships {
+		out = append(out, m.Organization.Models...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	bootstrapModels = out
+	bootstrapModelsAt = time.Now()
+	logger.Info(fmt.Sprintf("Fetched %d models from claude.ai", len(out)))
+	return out
+}
+
+// BootstrapModelIDs derives the /v1/models ids from the cached web-ui model
+// list: one base id per active model plus a "-think" variant when the web UI
+// offers extended thinking for it. ok=false when nothing has been fetched yet.
+func BootstrapModelIDs() ([]string, bool) {
+	bootstrapModelsLock.RLock()
+	defer bootstrapModelsLock.RUnlock()
+	if len(bootstrapModels) == 0 {
+		return nil, false
+	}
+	var out []string
+	for _, m := range bootstrapModels {
+		if m.Inactive {
+			continue
+		}
+		out = append(out, m.Model)
+		extended := false
+		for _, p := range m.PaprikaModes {
+			if p == "extended" {
+				extended = true
+			}
+		}
+		if extended {
+			out = append(out, m.Model+"-think")
+		}
+	}
+	return out, true
 }
 
 // ModelIDs returns the list of model ids exposed in /v1/models. For
@@ -756,6 +896,9 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("error reading response: %w", err)
 	}
+	// claude.ai never reports token counts, so estimate the output side from
+	// the assembled text for the usage object and the dashboard log.
+	gc.Set("CompletionTokens", utils.EstimateCompletionTokens(res_all_text))
 	if !stream {
 		model.ReturnOpenAIResponse(res_all_text, stream, gc)
 	} else {
