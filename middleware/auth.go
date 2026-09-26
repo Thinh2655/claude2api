@@ -16,6 +16,13 @@ func AuthMiddleware() gin.HandlerFunc {
 			return
 		}
 		Key := c.GetHeader("Authorization")
+		// EventSource (SSE) cannot send headers, so the dashboard passes the
+		// same key as ?apikey= for the /keys/api/recent/stream subscription.
+		if Key == "" {
+			if q := c.Query("apikey"); q != "" {
+				Key = "Bearer " + q
+			}
+		}
 		if Key != "" {
 			Key = strings.TrimPrefix(Key, "Bearer ")
 			if Key != config.ConfigInstance.APIKey {

@@ -3,6 +3,8 @@ package service
 import (
 	"claude2api/config"
 	"claude2api/utils"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -62,6 +64,7 @@ func recordRecent(c *gin.Context, session *config.SessionInfo, model string, sta
 		recentCount++
 	}
 	recentMu.Unlock()
+	broadcastRecent()
 }
 
 // recentSnapshot returns the stored requests newest-first.
@@ -78,6 +81,69 @@ func recentSnapshot() []recentRequest {
 // RecentRequestsHandler serves the last few requests for the dashboard.
 func RecentRequestsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"requests": recentSnapshot()})
+}
+
+// recentSubs are the open dashboard streams waiting for a push. Each channel
+// carries one pending notification; sends never block the request path.
+var (
+	recentSubMu sync.Mutex
+	recentSubs  = map[chan struct{}]struct{}{}
+)
+
+func broadcastRecent() {
+	recentSubMu.Lock()
+	defer recentSubMu.Unlock()
+	for ch := range recentSubs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// RecentStreamHandler pushes the recent-request list over SSE every time a
+// chat request finishes, so the dashboard updates without polling.
+func RecentStreamHandler(c *gin.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Writer.Flush()
+
+	ch := make(chan struct{}, 1)
+	recentSubMu.Lock()
+	recentSubs[ch] = struct{}{}
+	recentSubMu.Unlock()
+	defer func() {
+		recentSubMu.Lock()
+		delete(recentSubs, ch)
+		recentSubMu.Unlock()
+	}()
+
+	send := func() bool {
+		data, err := json.Marshal(gin.H{"requests": recentSnapshot()})
+		if err != nil {
+			return true
+		}
+		if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
+			return false
+		}
+		c.Writer.Flush()
+		return true
+	}
+	if !send() {
+		return
+	}
+	done := c.Request.Context().Done()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ch:
+			if !send() {
+				return
+			}
+		}
+	}
 }
 
 // firstUserText returns the first user message (best-effort preview); empty

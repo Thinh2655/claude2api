@@ -234,13 +234,22 @@ async function deleteAccount(key) {
   loadKeys();
 }
 
-async function loadRecent() {
+async function loadRecentOnce() {
   try {
     const res = await fetch('/keys/api/recent', { headers });
     if (!res.ok) return;
     const data = await res.json();
+    renderRecent(data.requests);
+  } catch (e) { /* dashboard keeps working when the endpoint is unreachable */ }
+  const es = new EventSource('/keys/api/recent/stream?apikey=' + encodeURIComponent(API_KEY));
+  es.onmessage = function(ev) {
+    try { renderRecent(JSON.parse(ev.data).requests); } catch (e) { /* ignore malformed push */ }
+  };
+}
+
+function renderRecent(requests) {
     const tbody = document.getElementById('recentBody');
-    const rows = (data.requests || []).map(function(r) {
+    const rows = (requests || []).map(function(r) {
       const t = new Date(r.time);
       const hh = String(t.getHours()).padStart(2, '0') + ':' +
                  String(t.getMinutes()).padStart(2, '0') + ':' +
@@ -259,8 +268,11 @@ async function loadRecent() {
     tbody.innerHTML = rows.length
       ? rows.join('')
       : '<tr><td colspan="7" style="color:var(--muted);">Chưa có request nào</td></tr>';
-  } catch (e) { /* dashboard keeps working when the endpoint is unreachable */ }
 }
+
+// loadRecentOnce fetches the table a single time on page load, then opens an
+// SSE stream that pushes a fresh list each time a chat request finishes. No
+// timer, no polling: idle dashboard = zero requests to the server.
 
 async function checkKeys(key) {
   const statusEl = document.getElementById('checkStatus');
@@ -296,9 +308,8 @@ async function checkKeys(key) {
 }
 
 loadKeys();
-loadRecent();
+loadRecentOnce();
 setInterval(loadKeys, 15000);
-setInterval(loadRecent, 5000);
 </script>
 </body>
 </html>`
