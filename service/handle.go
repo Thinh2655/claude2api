@@ -96,19 +96,19 @@ func ChatCompletionsHandler(c *gin.Context) {
 	// Rough input size, so the OpenAI usage object and the dashboard are not
 	// all-zero: claude.ai never reports token counts.
 	c.Set("PromptTokens", utils.EstimatePromptTokens(processor.Prompt.String()))
-	index := config.Sr.NextIndex()
-	// Attempt with retry mechanism - no local cooldown bookkeeping: a 429
-	// just moves to the next session immediately.
+	// Round-robin over EVERY account: a failed attempt parks that account for
+	// sessionCooldownTTL and the request moves on immediately, so all sessions
+	// are tried before the request is reported as failed.
 	// Remember the last upstream status so that if every session fails the
 	// underlying cause (e.g. a rate limit) is reported to the client instead
 	// of a generic 500.
+	order := roundRobinOrder(config.ConfigInstance.Sessions, config.Sr.NextIndex())
+
 	var lastStatus int
-	for i := 0; i < config.ConfigInstance.RetryCount; i++ {
-		index = (index + 1) % len(config.ConfigInstance.Sessions)
+	for _, index := range order {
 		session, err := config.ConfigInstance.GetSessionForModel(index)
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to get session for model %s: %v", model, err))
-			logger.Info("Retrying another session")
 			lastStatus = http.StatusServiceUnavailable
 			continue
 		}
@@ -135,10 +135,15 @@ func ChatCompletionsHandler(c *gin.Context) {
 		default:
 		}
 
-		// If we're here, the request failed - retry with another session
+		// Park the failing account so later requests skip it for a while
+		// instead of wasting time on a session that just rate-limited.
+		config.CooldownSession(session.SessionKey)
 		logger.Info("Retrying another session")
 	}
 
+	if len(order) == 0 {
+		lastStatus = http.StatusServiceUnavailable
+	}
 	logger.Error("Failed for all retries")
 	finalStatus := http.StatusInternalServerError
 	finalMsg := "Failed to process request after multiple attempts"
@@ -222,6 +227,10 @@ func parseAndValidateRequest(c *gin.Context) (*model.ChatCompletionRequest, erro
 		return nil, fmt.Errorf("no messages provided")
 	}
 
+	// Stash the client-requested tools so handleChatRequest can forward them
+	// upstream (stored bare to avoid the model-param shadowing the model pkg).
+	c.Set("ChatTools", req.Tools)
+
 	return &req, nil
 }
 
@@ -248,6 +257,31 @@ func extractSessionFromAuthHeader(c *gin.Context) (*config.SessionInfo, error) {
 	return config.NewSessionInfo(authInfo, ""), nil
 }
 
+// roundRobinOrder lists every enabled session index once starting at start,
+// with accounts still in cooldown pushed to the end (so a request that needs a
+// fallback tries a cooling account only when no fresh one remains). Manually
+// disabled accounts are skipped entirely.
+func roundRobinOrder(sessions []config.SessionInfo, start int) []int {
+	n := len(sessions)
+	if n == 0 {
+		return nil
+	}
+	start %= n
+	var fresh, cooling []int
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		if sessions[idx].Disabled {
+			continue
+		}
+		if config.SessionCooling(sessions[idx].SessionKey) {
+			cooling = append(cooling, idx)
+		} else {
+			fresh = append(fresh, idx)
+		}
+	}
+	return append(fresh, cooling...)
+}
+
 func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) (status int, ok bool) {
 	start := time.Now()
 	session.Lock()
@@ -263,8 +297,31 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		return status, false
 	}
 
+	// Function-calling shim: the web backend has no tools API, so client tool
+	// results come back as role=tool text and client function tools are
+	// described in the prompt (the model answers with a ```toolcall block).
+	if config.ConfigInstance.ToolsEnabled() {
+		if v, ok := c.Get("ChatTools"); ok {
+			if tools, ok := v.([]map[string]interface{}); ok && len(tools) > 0 {
+				if p := core.ToolPrompt(tools); p != "" {
+					processor.Prompt.WriteString(p)
+				}
+			}
+		}
+	}
+
 	// Initialize the Claude client
 	claudeClient := core.NewClientWithCookie(session.SessionKey, config.ConfigInstance.Proxy, model, session.ExtraCookie, session.DeviceID)
+	// Forward client-requested tools (web_search, artifacts, repl/code_interpreter)
+	// to the upstream tool list; unknown function tools are dropped since the
+	// web backend can't execute arbitrary functions.
+	if config.ConfigInstance.ToolsEnabled() {
+		if v, ok := c.Get("ChatTools"); ok {
+			if tools, ok := v.([]map[string]interface{}); ok {
+				claudeClient.SetTools(tools)
+			}
+		}
+	}
 
 	// Get org ID if not already set
 	if session.OrgID == "" {

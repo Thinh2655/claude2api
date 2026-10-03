@@ -79,6 +79,16 @@ const keysPageHTML = `<!DOCTYPE html>
   .gw-row select { flex: 1; margin-bottom: 0; }
   .gw-row button { white-space: nowrap; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); }
+  .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  .switch { position: relative; display: inline-block; width: 46px; height: 26px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; cursor: pointer; inset: 0; background: var(--border);
+    border-radius: 999px; transition: background .15s; }
+  .slider:before { content: ""; position: absolute; height: 18px; width: 18px; left: 4px; top: 4px;
+    background: #fff; border-radius: 50%; transition: transform .15s; }
+  .switch input:checked + .slider { background: var(--ok); }
+  .switch input:checked + .slider:before { transform: translateX(20px); }
+  .switch input:disabled + .slider { opacity: .5; cursor: wait; }
 </style>
 </head>
 <body>
@@ -93,7 +103,7 @@ const keysPageHTML = `<!DOCTYPE html>
   <div class="card">
     <h2>Tài khoản</h2>
     <table id="keysTable">
-      <thead><tr><th>Tên acc</th><th>Trạng thái</th><th>Gateway</th><th></th></tr></thead>
+      <thead><tr><th>Tên acc</th><th>Trạng thái</th><th>Gateway</th><th style="text-align:center;">Bật</th><th></th></tr></thead>
       <tbody id="keysBody"></tbody>
     </table>
     <div style="margin-top:.75rem; display:flex; gap:.75rem; align-items:center;">
@@ -102,6 +112,21 @@ const keysPageHTML = `<!DOCTYPE html>
     </div>
     <div class="msg" id="listMsg"></div>
     <div class="hint" style="margin-top:.5rem;">Chọn radio ở cột Gateway để đặt tài khoản dùng cho giao diện claude.ai tại cổng local. Để trống (không chọn) = tự chọn tài khoản có cookie.</div>
+  </div>
+
+  <div class="card">
+    <h2>Cài đặt</h2>
+    <div class="switch-row">
+      <div>
+        <div>Hỗ trợ tool (function-calling)</div>
+        <div class="hint">Forward tool client gửi lên model và trả <code>tool_calls</code> chuẩn OpenAI. Tắt = bỏ qua mọi tool trong request.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="toolsToggle" onchange="saveTools(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="msg" id="toolsMsg"></div>
   </div>
 
   <div class="card">
@@ -163,9 +188,10 @@ async function loadKeys() {
     const tr = document.createElement('tr');
     const checked = k.full === gatewayKey ? ' checked' : '';
     tr.innerHTML =
-      '<td><code>' + escapeHtml(label(k)) + '</code></td>' +
+      '<td><code' + (k.disabled ? ' style="opacity:.45; text-decoration:line-through;"' : '') + '>' + escapeHtml(label(k)) + '</code></td>' +
       '<td>' + statusBadge(k) + '</td>' +
-      '<td style="text-align:center;"><input type="radio" name="gw" value="' + escapeHtml(k.full) + '"' + checked + ' onchange="saveGatewayKey(this.value)"></td>' +
+      '<td style="text-align:center;"><input type="radio" name="gw" value="' + escapeHtml(k.full) + '"' + checked + (k.disabled ? ' disabled' : '') + ' onchange="saveGatewayKey(this.value)"></td>' +
+      '<td style="text-align:center;"><input type="checkbox"' + (k.disabled ? ' checked' : '') + ' onchange="toggleAccount(this, \'' + escapeHtml(k.full) + '\')"></td>' +
       '<td style="text-align:right; white-space:nowrap;">' +
         '<button class="btn-danger" style="margin-right:.4rem;" onclick="checkKeys(\'' + escapeHtml(k.full) + '\')">Kiểm tra</button>' +
         '<button class="btn-danger" onclick="deleteAccount(\'' + escapeHtml(k.full) + '\')">Xóa</button>' +
@@ -184,6 +210,65 @@ async function loadKeys() {
 }
 
 function cssEscape(s) { return s.replace(/"/g, '\\"'); }
+
+async function loadTools() {
+  const res = await fetch('/keys/api/tools', { headers });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('toolsToggle').checked = !!data.enableTools;
+}
+
+async function saveTools(el) {
+  const msg = document.getElementById('toolsMsg');
+  el.disabled = true;
+  try {
+    const res = await fetch('/keys/api/tools', {
+      method: 'POST', headers,
+      body: JSON.stringify({ enabled: el.checked })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      el.checked = !el.checked;
+      msg.textContent = data.error || 'Lưu thất bại';
+      msg.className = 'msg error';
+      return;
+    }
+    msg.textContent = 'Đã ' + (data.enableTools ? 'bật' : 'tắt') + ' hỗ trợ tool';
+    msg.className = 'msg success';
+  } catch (e) {
+    el.checked = !el.checked;
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    el.disabled = false;
+  }
+}
+
+async function toggleAccount(cb, key) {
+  const msg = document.getElementById('listMsg');
+  cb.disabled = true;
+  try {
+    const res = await fetch('/keys/api/toggle', {
+      method: 'POST', headers,
+      body: JSON.stringify({ key, disabled: cb.checked })
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      cb.checked = !cb.checked;
+      msg.textContent = data.message || data.error || 'Lưu thất bại';
+      msg.className = 'msg error';
+      cb.disabled = false;
+      return;
+    }
+    // re-render so the row reflects the new enabled/disabled look
+    loadKeys();
+  } catch (e) {
+    cb.checked = !cb.checked;
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+    cb.disabled = false;
+  }
+}
 
 function fmt(n) { return String(n || 0).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
 
@@ -308,6 +393,7 @@ async function checkKeys(key) {
 }
 
 loadKeys();
+loadTools();
 loadRecentOnce();
 setInterval(loadKeys, 15000);
 </script>

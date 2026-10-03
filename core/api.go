@@ -64,6 +64,75 @@ type toolUseInput struct {
 	Type       string `json:"type"`
 }
 
+// upstreamTool maps one OpenAI-style client tool to the claude.ai tool entry
+// it names, or nil when there is no upstream equivalent (arbitrary function
+// tools can't run on the web backend). Accepts both OpenAI shape
+// {"type":"function","function":{"name":...}} and flat {"name":...} entries.
+// ToolPrompt renders client function tools as instructions so the web model —
+// which has no function-calling API — invokes them by emitting a fenced
+// ```toolcall {"name":"...","arguments":{...}}``` block instead. Returns "" when
+// there are no function tools to describe.
+func ToolPrompt(clientTools []map[string]interface{}) string {
+	var b strings.Builder
+	for _, t := range clientTools {
+		fn, ok := t["function"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		if name == "" || strings.ToLower(name) == "web_search" {
+			continue
+		}
+		desc, _ := fn["description"].(string)
+		params, _ := json.Marshal(fn["parameters"])
+		fmt.Fprintf(&b, "- %s: %s Schema: %s\n", name, desc, params)
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return "You have these tools; to call one reply with ONLY a fenced block ```toolcall {\"name\":\"<tool>\",\"arguments\":{...}}``` and no other text:\n" + b.String() + "\n"
+}
+
+func upstreamTool(t map[string]interface{}) map[string]interface{} {
+	name := ""
+	if fn, ok := t["function"].(map[string]interface{}); ok {
+		name, _ = fn["name"].(string)
+	}
+	if name == "" {
+		name, _ = t["name"].(string)
+	}
+	switch strings.ToLower(name) {
+	case "web_search", "websearch":
+		return map[string]interface{}{"type": "web_search_v0", "name": "web_search"}
+	case "artifacts", "artifact":
+		return map[string]interface{}{"type": "artifacts_v0", "name": "artifacts"}
+	case "repl", "code_interpreter":
+		return map[string]interface{}{"type": "repl_v0", "name": "repl"}
+	}
+	if typ, _ := t["type"].(string); strings.HasSuffix(typ, "_v0") {
+		return map[string]interface{}{"type": typ, "name": name}
+	}
+	return nil
+}
+
+// resolveUpstreamTools converts client-requested tools to the claude.ai tool
+// list. Empty (or all-unknown) client list keeps the defaults.
+func resolveUpstreamTools(clientTools []map[string]interface{}, defaults []map[string]interface{}) []map[string]interface{} {
+	if len(clientTools) == 0 {
+		return defaults
+	}
+	var out []map[string]interface{}
+	for _, t := range clientTools {
+		if u := upstreamTool(t); u != nil {
+			out = append(out, u)
+		}
+	}
+	if len(out) == 0 {
+		return defaults
+	}
+	return out
+}
+
 // stableDeviceID derives a per-session UUID so claude.ai sees a consistent
 // "device" for each sessionKey, like the web app does for a browser.
 func stableDeviceID(sessionKey string) string {
@@ -465,6 +534,16 @@ func NewClientWithCookie(sessionKey string, proxy string, model string, cookie s
 	return c
 }
 
+// SetTools overrides the default upstream tool list with the client-requested
+// one. Empty (or all-unknown) input keeps the defaults.
+func (c *Client) SetTools(clientTools []map[string]interface{}) {
+	if len(clientTools) == 0 {
+		return
+	}
+	defaults, _ := c.defaultAttrs["tools"].([]map[string]interface{})
+	c.defaultAttrs["tools"] = resolveUpstreamTools(clientTools, defaults)
+}
+
 // SetOrgID sets the organization ID for the client
 func (c *Client) SetOrgID(orgID string) {
 	c.orgID = orgID
@@ -733,6 +812,9 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	res_all_text := ""
 	partial_json_shown := false
 	languageStr := "md"
+	// Holds back a leading ```toolcall block so it streams as tool_calls, not
+	// raw JSON content.
+	toolFilter := &model.StreamToolFilter{}
 	// pendingJSON accumulates a tool_use input_json_delta object until it parses
 	// as a complete JSON object, so we can extract the code field intact.
 	pendingJSON := ""
@@ -824,7 +906,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				if !stream {
 					continue
 				}
-				model.ReturnOpenAIResponse(res_text, stream, gc)
+				toolFilter.Feed(res_text, stream, gc)
 				continue
 			}
 			if event.Delta.Type == "thinking_delta" {
@@ -900,9 +982,10 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	// the assembled text for the usage object and the dashboard log.
 	gc.Set("CompletionTokens", utils.EstimateCompletionTokens(res_all_text))
 	if !stream {
-		model.ReturnOpenAIResponse(res_all_text, stream, gc)
+		model.ResponseWithTools(res_all_text, stream, gc)
 	} else {
-		// 发送结束标志
+		// Flush any held-back text/toolcall block, then the end marker.
+		toolFilter.Finish(gc)
 		gc.Writer.Write([]byte("data: [DONE]\n\n"))
 		gc.Writer.Flush()
 	}

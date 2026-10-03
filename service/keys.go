@@ -20,6 +20,7 @@ type keyInfo struct {
 	DisplayName string `json:"displayName,omitempty"`
 	HasCookie   bool   `json:"hasCookie"`
 	HasOrgID    bool   `json:"hasOrgID"`
+	Disabled    bool   `json:"disabled"`
 }
 
 type keysResponse struct {
@@ -58,6 +59,7 @@ func KeysListHandler(c *gin.Context) {
 			DisplayName: s.DisplayName,
 			HasCookie:   s.ExtraCookie != "",
 			HasOrgID:    s.OrgID != "",
+			Disabled:    s.Disabled,
 		})
 	}
 	c.JSON(http.StatusOK, resp)
@@ -168,6 +170,64 @@ func GatewayKeySetHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Gateway key updated"})
 }
 
+// ToolsGetHandler returns whether tool support is enabled
+func ToolsGetHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"enableTools": config.ConfigInstance.ToolsEnabled()})
+}
+
+// ToolsSetHandler toggles tool support and persists it to .env
+func ToolsSetHandler(c *gin.Context) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"enabled\": true|false}"})
+		return
+	}
+	config.ConfigInstance.RwMutx.Lock()
+	config.ConfigInstance.EnableTools = body.Enabled
+	config.ConfigInstance.RwMutx.Unlock()
+	if err := saveEnvLine("ENABLE_TOOLS", fmt.Sprintf("%t", body.Enabled)); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist ENABLE_TOOLS to .env: %v", err))
+	}
+	c.JSON(http.StatusOK, gin.H{"enableTools": body.Enabled})
+}
+
+// KeyToggleHandler enables/disables an account; disabled accounts are skipped
+// by round-robin. Body: {"key": "<full>", "disabled": true|false}
+func KeyToggleHandler(c *gin.Context) {
+	var body struct {
+		Key      string `json:"key"`
+		Disabled bool   `json:"disabled"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Key) == "" {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"key\": \"<full session key>\", \"disabled\": true|false}"})
+		return
+	}
+	config.ConfigInstance.RwMutx.Lock()
+	found := false
+	for i := range config.ConfigInstance.Sessions {
+		if config.ConfigInstance.Sessions[i].SessionKey == body.Key {
+			config.ConfigInstance.Sessions[i].Disabled = body.Disabled
+			found = true
+			break
+		}
+	}
+	config.ConfigInstance.RwMutx.Unlock()
+	if !found {
+		c.JSON(http.StatusNotFound, ErrorResponse{Error: "Account not found"})
+		return
+	}
+	if err := persistCookieAccounts(); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist accounts: %v", err))
+	}
+	state := "enabled"
+	if body.Disabled {
+		state = "disabled"
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Account " + state})
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -187,8 +247,9 @@ func persistCookieAccounts() error {
 			continue
 		}
 		accounts = append(accounts, config.CookieAccount{
-			Name:    s.DisplayName,
-			Cookies: s.CookieJSON,
+			Name:     s.DisplayName,
+			Disabled: s.Disabled,
+			Cookies:  s.CookieJSON,
 		})
 	}
 	config.ConfigInstance.RwMutx.RUnlock()

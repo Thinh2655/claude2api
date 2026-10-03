@@ -25,8 +25,8 @@ chatDelete: true
 # Maximum chat history length (default: 10000)
 maxChatHistoryLength: 10000
 
-# Retry count (default: number of sessions, max 5)
-retryCount: 2
+# Tool support: forward client tools upstream + return OpenAI tool_calls (default: true)
+enableTools: true
 
 # Role prefix settings
 noRolePrefix: false

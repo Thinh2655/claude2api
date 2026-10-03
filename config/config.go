@@ -22,6 +22,9 @@ type SessionInfo struct {
 	// DisplayName is an optional human label for the account (e.g. an email),
 	// shown in the UI instead of the raw session key.
 	DisplayName string `yaml:"displayName,omitempty"`
+	// Disabled flags the account as manually powered off (persisted to
+	// accounts.json); disabled accounts are skipped by round-robin.
+	Disabled bool `yaml:"-" json:"-"`
 	// ExtraCookie is the full browser Cookie header (cf_bm, routingHint, …)
 	// attached to upstream requests alongside sessionKey. Loaded from a cookie
 	// file/account when present.
@@ -74,27 +77,26 @@ type Config struct {
 	Proxy                  string        `yaml:"proxy"`
 	ChatDelete             bool          `yaml:"chatDelete"`
 	MaxChatHistoryLength   int           `yaml:"maxChatHistoryLength"`
-	RetryCount             int           `yaml:"retryCount"`
 	NoRolePrefix           bool          `yaml:"noRolePrefix"`
 	PromptDisableArtifacts bool          `yaml:"promptDisableArtifacts"`
 	EnableMirrorApi        bool          `yaml:"enableMirrorApi"`
 	MirrorApiPrefix        string        `yaml:"mirrorApiPrefix"`
+	// EnableTools forwards client-requested tools to the model (web_search,
+	// artifacts, repl) and exposes client function tools as OpenAI tool_calls.
+	EnableTools            bool          `yaml:"enableTools"`
 	EnableGateway          bool          `yaml:"enableGateway"` // phục vụ giao diện claude.ai tại localhost
 	GatewayKey             string        `yaml:"gatewayKey"`    // sessionKey gateway ưu tiên dùng; rỗng = tự chọn
 	RwMutx                 sync.RWMutex  `yaml:"-"`             // 不从YAML加载
 }
 
 // 解析 SESSIONS 格式的环境变量
-func parseSessionEnv(envValue string) (int, []SessionInfo) {
+func parseSessionEnv(envValue string) []SessionInfo {
 	if envValue == "" {
-		return 0, []SessionInfo{}
+		return []SessionInfo{}
 	}
 	var sessions []SessionInfo
-	sessionPairs := strings.Split(envValue, ",")
-	retryCount := len(sessionPairs) // 重试次数等于 session 数量
-	for _, pair := range sessionPairs {
+	for _, pair := range strings.Split(envValue, ",") {
 		if pair == "" {
-			retryCount--
 			continue
 		}
 		parts := strings.Split(pair, ":")
@@ -104,10 +106,7 @@ func parseSessionEnv(envValue string) (int, []SessionInfo) {
 		}
 		sessions = append(sessions, *NewSessionInfoWithCookie(parts[0], orgID, "", "", ""))
 	}
-	if retryCount > 5 {
-		retryCount = 5 // 限制最大重试次数为 5 次
-	}
-	return retryCount, sessions
+	return sessions
 }
 
 // 根据模型选择合适的 session
@@ -118,6 +117,13 @@ func (c *Config) GetSessionForModel(idx int) (*SessionInfo, error) {
 	c.RwMutx.RLock()
 	defer c.RwMutx.RUnlock()
 	return &c.Sessions[idx], nil
+}
+
+// ToolsEnabled reports whether tool support is on (safe under the config lock).
+func (c *Config) ToolsEnabled() bool {
+	c.RwMutx.RLock()
+	defer c.RwMutx.RUnlock()
+	return c.EnableTools
 }
 
 // SetGatewayKey stores the preferred gateway session key
@@ -202,6 +208,45 @@ func (c *Config) SetSessionDisplayName(sessionKey, name string) {
 		}
 	}
 }
+// Session cooldown: after a failed request an account is parked for a short
+// while so later requests skip it and don't waste time re-hitting a session
+// that just failed (e.g. rate-limited).
+// ponytail: fixed 30s TTL, no backoff ladder or per-model keys — add if a
+// session needs to cool longer per model tier.
+const sessionCooldownTTL = 30 * time.Second
+
+var (
+	cooldownMu sync.Mutex
+	cooldownAt = map[string]time.Time{}
+)
+
+func CooldownSession(sessionKey string) {
+	cooldownMu.Lock()
+	cooldownAt[sessionKey] = time.Now().Add(sessionCooldownTTL)
+	cooldownMu.Unlock()
+}
+
+func SessionCooling(sessionKey string) bool {
+	cooldownMu.Lock()
+	defer cooldownMu.Unlock()
+	until, ok := cooldownAt[sessionKey]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(cooldownAt, sessionKey)
+		return false
+	}
+	return true
+}
+
+// ClearCooldown forgets every cooldown (tests only).
+func ClearCooldown() {
+	cooldownMu.Lock()
+	cooldownAt = map[string]time.Time{}
+	cooldownMu.Unlock()
+}
+
 func (sr *SessionRagen) NextIndex() int {
 	sr.Mutex.Lock()
 	defer sr.Mutex.Unlock()
@@ -327,8 +372,9 @@ func LoadSessionFromCookie(cookiePath string) (SessionInfo, bool) {
 // CookieAccount is one cookie-account stored in accounts.json: an optional
 // display name plus the exported browser cookie array.
 type CookieAccount struct {
-	Name    string       `json:"name,omitempty"`
-	Cookies []CookieFile `json:"cookies"`
+	Name     string       `json:"name,omitempty"`
+	Disabled bool         `json:"disabled,omitempty"`
+	Cookies  []CookieFile `json:"cookies"`
 }
 
 // LoadCookieAccounts reads accounts.json (array of CookieAccount) and the
@@ -357,6 +403,7 @@ func LoadCookieAccounts(accountsPath string) ([]SessionInfo, bool) {
 			continue
 		}
 		if s, ok2 := buildSessionFromCookies(a.Name, a.Cookies); ok2 {
+			s.Disabled = a.Disabled
 			out = append(out, s)
 			ok = true
 		}
@@ -374,11 +421,8 @@ func loadConfigFromEnv() *Config {
 	// accounts) + legacy cookie.json; fall back to the SESSIONS env var only
 	// when no cookie account is configured.
 	sessions, haveCookie := LoadCookieAccounts("accounts.json")
-	retryCount := len(sessions)
 	if !haveCookie {
-		envRetry, envSessions := parseSessionEnv(os.Getenv("SESSIONS"))
-		retryCount = envRetry
-		sessions = envSessions
+		sessions = parseSessionEnv(os.Getenv("SESSIONS"))
 	}
 	config := &Config{
 		// 解析 SESSIONS 环境变量
@@ -394,8 +438,6 @@ func loadConfigFromEnv() *Config {
 		ChatDelete: os.Getenv("CHAT_DELETE") != "false",
 		// 设置最大聊天历史长度
 		MaxChatHistoryLength: maxChatHistoryLength,
-		// 设置重试次数
-		RetryCount: retryCount,
 		// 设置是否使用角色前缀
 		NoRolePrefix: os.Getenv("NO_ROLE_PREFIX") == "true",
 		// 设置是否使用提示词禁用artifacts
@@ -406,6 +448,8 @@ func loadConfigFromEnv() *Config {
 		MirrorApiPrefix: os.Getenv("MIRROR_API_PREFIX"),
 		// 设置是否启用网关（本地模拟 claude.ai 网页）
 		EnableGateway: os.Getenv("ENABLE_GATEWAY") == "true",
+		// Bật/tắt hỗ trợ tool (mặc định bật)
+		EnableTools: os.Getenv("ENABLE_TOOLS") != "false",
 		// 网关优先使用的 sessionKey（可选）
 		GatewayKey: os.Getenv("GATEWAY_KEY"),
 		// 设置读写锁
@@ -454,7 +498,6 @@ func init() {
 	}
 	ConfigInstance = LoadConfig()
 	logger.Info("Loaded config:")
-	logger.Info(fmt.Sprintf("Max Retry count: %d", ConfigInstance.RetryCount))
 	for i := range ConfigInstance.Sessions {
 		logger.Info(fmt.Sprintf("Session: %s, OrgID: %s", ConfigInstance.Sessions[i].SessionKey, ConfigInstance.Sessions[i].OrgID))
 	}
@@ -468,4 +511,5 @@ func init() {
 	logger.Info(fmt.Sprintf("EnableMirrorApi: %t", ConfigInstance.EnableMirrorApi))
 	logger.Info(fmt.Sprintf("MirrorApiPrefix: %s", ConfigInstance.MirrorApiPrefix))
 	logger.Info(fmt.Sprintf("EnableGateway: %t", ConfigInstance.EnableGateway))
+	logger.Info(fmt.Sprintf("EnableTools: %t", ConfigInstance.EnableTools))
 }

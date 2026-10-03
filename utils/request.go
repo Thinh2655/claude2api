@@ -4,9 +4,19 @@ package utils
 import (
 	"claude2api/config"
 	"claude2api/logger"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
+
+// contentString renders a message content field (string or structured) as text.
+func contentString(content interface{}) string {
+	if s, ok := content.(string); ok {
+		return s
+	}
+	b, _ := json.Marshal(content)
+	return string(b)
+}
 
 // ChatRequestProcessor handles common chat request processing logic
 type ChatRequestProcessor struct {
@@ -34,6 +44,16 @@ func (p *ChatRequestProcessor) ProcessMessages(messages []map[string]interface{}
 		role, roleOk := msg["role"].(string)
 		if !roleOk {
 			continue // Skip invalid format
+		}
+		if role == "tool" {
+			// Function-calling shim: the web backend has no tools API, so feed
+			// tool results back to the model as plain text.
+			p.Prompt.WriteString("Tool result")
+			if name, ok := msg["name"].(string); ok && name != "" {
+				p.Prompt.WriteString(" (" + name + ")")
+			}
+			p.Prompt.WriteString(": " + contentString(msg["content"]) + "\n\n")
+			continue
 		}
 
 		content, exists := msg["content"]
