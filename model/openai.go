@@ -60,15 +60,17 @@ type NoStreamChoice struct {
 
 // Delta 结构用于存储返回的文本内容
 type Delta struct {
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 type Message struct {
-	Role       string        `json:"role"`
-	Content    string        `json:"content,omitempty"`
-	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
-	Refusal    interface{}   `json:"refusal"`
-	Annotation []interface{} `json:"annotation"`
+	Role             string        `json:"role"`
+	Content          string        `json:"content,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
+	Refusal          interface{}   `json:"refusal"`
+	Annotation       []interface{} `json:"annotation"`
 }
 
 type OpenAIResponse struct {
@@ -94,6 +96,44 @@ func requestedModel(gc *gin.Context) string {
 		}
 	}
 	return "claude-sonnet-5"
+}
+
+func ReturnOpenAIReasoningResponse(reasoning string, stream bool, gc *gin.Context) error {
+	if stream {
+		return streamReasoningResponse(reasoning, gc)
+	}
+	return nil
+}
+
+func streamReasoningResponse(reasoning string, gc *gin.Context) error {
+	openAIResp := &OpenAISrteamResponse{
+		ID:      uuid.New().String(),
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   requestedModel(gc),
+		Choices: []StreamChoice{
+			{
+				Index: 0,
+				Delta: Delta{
+					ReasoningContent: reasoning,
+				},
+				Logprobs:     nil,
+				FinishReason: nil,
+			},
+		},
+	}
+
+	jsonBytes, err := json.Marshal(openAIResp)
+	if err != nil {
+		logger.Error(fmt.Sprintf("Error marshalling JSON: %v", err))
+		return err
+	}
+	jsonBytes = append([]byte("data: "), jsonBytes...)
+	jsonBytes = append(jsonBytes, []byte("\n\n")...)
+
+	gc.Writer.Write(jsonBytes)
+	gc.Writer.Flush()
+	return nil
 }
 
 func ReturnOpenAIResponse(text string, stream bool, gc *gin.Context) error {
@@ -174,23 +214,26 @@ func ExtractToolCalls(text string) (string, []ToolCall) {
 	return strings.TrimSpace(cleaned), calls
 }
 
-func ResponseWithTools(text string, stream bool, gc *gin.Context) error {
+func ResponseWithTools(text string, reasoning string, stream bool, gc *gin.Context) error {
 	cleaned, calls := ExtractToolCalls(text)
 	if len(calls) == 0 {
-		return ReturnOpenAIResponse(text, stream, gc)
+		if stream {
+			return streamRespose(text, gc)
+		}
+		return noStreamResponseWithReasoning(text, reasoning, gc)
 	}
 	if stream {
 		return streamToolResponse(cleaned, calls, gc)
 	}
-	return noStreamToolResponse(cleaned, calls, gc)
+	return noStreamToolResponseWithReasoning(cleaned, reasoning, calls, gc)
 }
 
-func noStreamToolResponse(text string, calls []ToolCall, gc *gin.Context) error {
+func noStreamToolResponseWithReasoning(text string, reasoning string, calls []ToolCall, gc *gin.Context) error {
 	promptTokens := 0
 	if v, ok := gc.Get("PromptTokens"); ok {
 		promptTokens, _ = v.(int)
 	}
-	completionTokens := utils.EstimateCompletionTokens(text)
+	completionTokens := utils.EstimateCompletionTokens(text + reasoning)
 	openAIResp := &OpenAIResponse{
 		ID:      uuid.New().String(),
 		Object:  "chat.completion",
@@ -200,9 +243,10 @@ func noStreamToolResponse(text string, calls []ToolCall, gc *gin.Context) error 
 			{
 				Index: 0,
 				Message: Message{
-					Role:      "assistant",
-					Content:   text,
-					ToolCalls: calls,
+					Role:             "assistant",
+					Content:          text,
+					ReasoningContent: reasoning,
+					ToolCalls:        calls,
 				},
 				Logprobs:     nil,
 				FinishReason: "tool_calls",
@@ -304,11 +348,15 @@ func (f *StreamToolFilter) Finish(gc *gin.Context) {
 }
 
 func noStreamResponse(text string, gc *gin.Context) error {
+	return noStreamResponseWithReasoning(text, "", gc)
+}
+
+func noStreamResponseWithReasoning(text string, reasoning string, gc *gin.Context) error {
 	promptTokens := 0
 	if v, ok := gc.Get("PromptTokens"); ok {
 		promptTokens, _ = v.(int)
 	}
-	completionTokens := utils.EstimateCompletionTokens(text)
+	completionTokens := utils.EstimateCompletionTokens(text + reasoning)
 	openAIResp := &OpenAIResponse{
 		ID:      uuid.New().String(),
 		Object:  "chat.completion",
@@ -318,8 +366,9 @@ func noStreamResponse(text string, gc *gin.Context) error {
 			{
 				Index: 0,
 				Message: Message{
-					Role:    "assistant",
-					Content: text,
+					Role:             "assistant",
+					Content:          text,
+					ReasoningContent: reasoning,
 				},
 				Logprobs:     nil,
 				FinishReason: "stop",

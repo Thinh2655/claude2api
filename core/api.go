@@ -870,8 +870,8 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 	clientDone := gc.Request.Context().Done()
 	// Keep track of the full response for the final message
-	thinkingShown := false
 	res_all_text := ""
+	res_reasoning_text := ""
 	partial_json_shown := false
 	languageStr := "md"
 	// Holds back a leading ```toolcall block so it streams as tool_calls, not
@@ -939,32 +939,17 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 					pendingJSON = ""
 					languageStr = "md"
 				}
-				var res_text string
-				if thinkingShown {
-					res_text += "</think>\n"
-					thinkingShown = false
-				}
 				if partial_json_shown {
-					res_text += "\n```\n"
+					closeCode := "\n```\n"
 					partial_json_shown = false
-				}
-				if res_text != "" {
-					res_all_text += res_text
+					res_all_text += closeCode
 					if stream {
-						model.ReturnOpenAIResponse(res_text, stream, gc)
+						model.ReturnOpenAIResponse(closeCode, stream, gc)
 					}
 				}
 				continue
 			}
 			if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
-				if thinkingShown {
-					closeThink := "</think>\n"
-					res_all_text += closeThink
-					if stream {
-						model.ReturnOpenAIResponse(closeThink, stream, gc)
-					}
-					thinkingShown = false
-				}
 				res_text := event.Delta.Text
 				res_all_text += res_text
 				if !stream {
@@ -974,16 +959,12 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				continue
 			}
 			if event.Delta.Type == "thinking_delta" {
-				res_text := event.Delta.THINKING
-				if !thinkingShown {
-					res_text = "<think> " + res_text
-					thinkingShown = true
-				}
-				res_all_text += res_text
+				reasoning := event.Delta.THINKING
+				res_reasoning_text += reasoning
 				if !stream {
 					continue
 				}
-				model.ReturnOpenAIResponse(res_text, stream, gc)
+				model.ReturnOpenAIReasoningResponse(reasoning, stream, gc)
 				continue
 			}
 			if event.Delta.Type == "input_json_delta" {
@@ -1001,17 +982,13 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 					continue
 				}
 
-				// If tool metadata (description/command/query) is available, stream it into thinking
+				// If tool metadata (description/command/query) is available, stream it into reasoning_content
 				if !toolLogEmitted {
 					if logMsg := formatToolThinkingLog(input); logMsg != "" {
 						tText := logMsg + "\n"
-						if !thinkingShown {
-							tText = "<think>\n" + tText
-							thinkingShown = true
-						}
-						res_all_text += tText
+						res_reasoning_text += tText
 						if stream {
-							model.ReturnOpenAIResponse(tText, stream, gc)
+							model.ReturnOpenAIReasoningResponse(tText, stream, gc)
 						}
 						toolLogEmitted = true
 					}
@@ -1029,14 +1006,6 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 					// params, …): drop the metadata entirely.
 					pendingJSON = ""
 					continue
-				}
-				if thinkingShown {
-					closeThink := "</think>\n"
-					res_all_text += closeThink
-					if stream {
-						model.ReturnOpenAIResponse(closeThink, stream, gc)
-					}
-					thinkingShown = false
 				}
 				out := code
 				// Open a fenced code block before the first artifact output.
@@ -1059,9 +1028,9 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	}
 	// claude.ai never reports token counts, so estimate the output side from
 	// the assembled text for the usage object and the dashboard log.
-	gc.Set("CompletionTokens", utils.EstimateCompletionTokens(res_all_text))
+	gc.Set("CompletionTokens", utils.EstimateCompletionTokens(res_all_text+res_reasoning_text))
 	if !stream {
-		model.ResponseWithTools(res_all_text, stream, gc)
+		model.ResponseWithTools(res_all_text, res_reasoning_text, stream, gc)
 	} else {
 		// Flush any held-back text/toolcall block, then the end marker.
 		toolFilter.Finish(gc)
