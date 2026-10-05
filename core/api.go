@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,6 +63,43 @@ type toolUseInput struct {
 	Content    string `json:"content"`
 	Language   string `json:"language"`
 	Type       string `json:"type"`
+	Path       string `json:"path"`
+}
+
+func detectToolLanguage(input toolUseInput) string {
+	if input.Language != "" {
+		return input.Language
+	}
+	if input.Type == "text/html" || input.Type == "html" {
+		return "html"
+	}
+	if input.Type != "" && !strings.Contains(input.Type, "/") {
+		return input.Type
+	}
+	if input.Path != "" {
+		ext := strings.TrimPrefix(filepath.Ext(input.Path), ".")
+		switch strings.ToLower(ext) {
+		case "js", "jsx":
+			return "javascript"
+		case "ts", "tsx":
+			return "typescript"
+		case "py":
+			return "python"
+		case "rb":
+			return "ruby"
+		case "rs":
+			return "rust"
+		case "sh", "bash":
+			return "bash"
+		case "yml":
+			return "yaml"
+		case "":
+			return "text"
+		default:
+			return strings.ToLower(ext)
+		}
+	}
+	return "text"
 }
 
 // upstreamTool maps one OpenAI-style client tool to the claude.ai tool entry
@@ -862,16 +900,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 						if code != "" {
 							out := code
 							if !partial_json_shown {
-								lang := input.Language
-								if lang == "" {
-									lang = input.Type
-								}
-								if lang == "text/html" || lang == "html" {
-									lang = "html"
-								}
-								if lang != "" {
-									languageStr = lang
-								}
+								languageStr = detectToolLanguage(input)
 								out = "\n```" + languageStr + "\n" + out
 								partial_json_shown = true
 							}
@@ -953,16 +982,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				out := code
 				// Open a fenced code block before the first artifact output.
 				if !partial_json_shown {
-					lang := input.Language
-					if lang == "" {
-						lang = input.Type
-					}
-					if lang == "text/html" || lang == "html" {
-						lang = "html"
-					}
-					if lang != "" {
-						languageStr = lang
-					}
+					languageStr = detectToolLanguage(input)
 					out = "\n```" + languageStr + "\n" + out
 					partial_json_shown = true
 				}

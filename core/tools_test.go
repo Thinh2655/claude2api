@@ -30,3 +30,23 @@ func TestUpstreamTool(t *testing.T) {
 		t.Fatal("all-unknown input must keep defaults")
 	}
 }
+
+func TestDetectToolLanguage(t *testing.T) {
+	cases := []struct {
+		input toolUseInput
+		want  string
+	}{
+		{toolUseInput{Language: "python"}, "python"},
+		{toolUseInput{Type: "text/html"}, "html"},
+		{toolUseInput{Path: "main.go"}, "go"},
+		{toolUseInput{Path: "/app/src/index.tsx"}, "typescript"},
+		{toolUseInput{Path: "script.py"}, "python"},
+		{toolUseInput{Path: "unknown.xyz"}, "xyz"},
+		{toolUseInput{}, "text"},
+	}
+	for _, c := range cases {
+		if got := detectToolLanguage(c.input); got != c.want {
+			t.Fatalf("detectToolLanguage(%+v) = %s, want %s", c.input, got, c.want)
+		}
+	}
+}
