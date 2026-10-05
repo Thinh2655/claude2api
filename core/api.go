@@ -58,12 +58,36 @@ type ResponseEvent struct {
 // couple of hints (language/type) for the fenced code block; command/path/
 // description/filepaths metadata is dropped from the streamed output.
 type toolUseInput struct {
-	FileText   string `json:"file_text"`
-	WidgetCode string `json:"widget_code"`
-	Content    string `json:"content"`
-	Language   string `json:"language"`
-	Type       string `json:"type"`
-	Path       string `json:"path"`
+	FileText    string `json:"file_text"`
+	WidgetCode  string `json:"widget_code"`
+	Content     string `json:"content"`
+	Language    string `json:"language"`
+	Type        string `json:"type"`
+	Path        string `json:"path"`
+	Command     string `json:"command"`
+	Description string `json:"description"`
+	Query       string `json:"query"`
+}
+
+func formatToolThinkingLog(input toolUseInput) string {
+	var parts []string
+	if input.Description != "" {
+		parts = append(parts, input.Description)
+	}
+	if input.Command != "" && input.Path != "" {
+		parts = append(parts, fmt.Sprintf("%s %s", input.Command, input.Path))
+	} else if input.Path != "" {
+		parts = append(parts, input.Path)
+	} else if input.Command != "" {
+		parts = append(parts, input.Command)
+	}
+	if input.Query != "" {
+		parts = append(parts, fmt.Sprintf("Search: %s", input.Query))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " | ")
 }
 
 func detectToolLanguage(input toolUseInput) string {
@@ -856,6 +880,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	// pendingJSON accumulates a tool_use input_json_delta object until it parses
 	// as a complete JSON object, so we can extract the code field intact.
 	pendingJSON := ""
+	toolLogEmitted := false
 	for scanner.Scan() {
 		select {
 		case <-clientDone:
@@ -884,6 +909,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				return errors.New(event.Error.Message)
 			}
 			if event.Type == "content_block_stop" {
+				toolLogEmitted = false
 				// Flush any tool_use input still pending at block end. By now
 				// the object should parse; if it does and carries a code field,
 				// stream that. Otherwise drop the metadata.
@@ -913,23 +939,32 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 					pendingJSON = ""
 					languageStr = "md"
 				}
-				res_text := ""
+				var res_text string
 				if thinkingShown {
-					res_text = "</think>\n"
+					res_text += "</think>\n"
 					thinkingShown = false
 				}
 				if partial_json_shown {
-					res_text = "\n```\n"
+					res_text += "\n```\n"
 					partial_json_shown = false
 				}
-				res_all_text += res_text
-				if !stream {
-					continue
+				if res_text != "" {
+					res_all_text += res_text
+					if stream {
+						model.ReturnOpenAIResponse(res_text, stream, gc)
+					}
 				}
-				model.ReturnOpenAIResponse(res_text, stream, gc)
 				continue
 			}
 			if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
+				if thinkingShown {
+					closeThink := "</think>\n"
+					res_all_text += closeThink
+					if stream {
+						model.ReturnOpenAIResponse(closeThink, stream, gc)
+					}
+					thinkingShown = false
+				}
 				res_text := event.Delta.Text
 				res_all_text += res_text
 				if !stream {
@@ -965,6 +1000,22 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 					// Object not complete yet (cut mid-escape/multibyte) — wait.
 					continue
 				}
+
+				// If tool metadata (description/command/query) is available, stream it into thinking
+				if !toolLogEmitted {
+					if logMsg := formatToolThinkingLog(input); logMsg != "" {
+						tText := logMsg + "\n"
+						if !thinkingShown {
+							tText = "<think>\n" + tText
+							thinkingShown = true
+						}
+						res_all_text += tText
+						if stream {
+							model.ReturnOpenAIResponse(tText, stream, gc)
+						}
+						toolLogEmitted = true
+					}
+				}
 				// Pick the code field present in this tool input.
 				code := input.FileText
 				if code == "" {
@@ -978,6 +1029,14 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 					// params, …): drop the metadata entirely.
 					pendingJSON = ""
 					continue
+				}
+				if thinkingShown {
+					closeThink := "</think>\n"
+					res_all_text += closeThink
+					if stream {
+						model.ReturnOpenAIResponse(closeThink, stream, gc)
+					}
+					thinkingShown = false
 				}
 				out := code
 				// Open a fenced code block before the first artifact output.

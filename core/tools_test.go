@@ -50,3 +50,20 @@ func TestDetectToolLanguage(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatToolThinkingLog(t *testing.T) {
+	cases := []struct {
+		input toolUseInput
+		want  string
+	}{
+		{toolUseInput{Description: "Writing animation script", Command: "create", Path: "anim.py"}, "Writing animation script | create anim.py"},
+		{toolUseInput{Command: "update", Path: "main.go"}, "update main.go"},
+		{toolUseInput{Query: "claude api"}, "Search: claude api"},
+		{toolUseInput{}, ""},
+	}
+	for _, c := range cases {
+		if got := formatToolThinkingLog(c.input); got != c.want {
+			t.Fatalf("formatToolThinkingLog(%+v) = %s, want %s", c.input, got, c.want)
+		}
+	}
+}
