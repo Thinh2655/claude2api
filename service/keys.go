@@ -21,6 +21,12 @@ type keyInfo struct {
 	HasCookie   bool   `json:"hasCookie"`
 	HasOrgID    bool   `json:"hasOrgID"`
 	Disabled    bool   `json:"disabled"`
+	// Usage-limit lock (acc bị "You've hit your limit"): true khi acc đang bị
+	// tạm khóa, kèm thời gian mở khóa + giây còn lại để dashboard đếm ngược.
+	Limited          bool   `json:"limited"`
+	LimitedUntil     string `json:"limitedUntil,omitempty"`
+	LimitedRemaining int64  `json:"limitedRemaining,omitempty"`
+	LimitReason      string `json:"limitReason,omitempty"`
 }
 
 type keysResponse struct {
@@ -45,22 +51,47 @@ func displayLabel(s *config.SessionInfo) string {
 }
 
 // KeysListHandler returns all configured accounts (cookie-based) with a
-// display label (account name if set, otherwise a masked key)
+// display label (account name if set, otherwise a masked key), plus the
+// usage-limit lock state (limited + countdown) so the dashboard can show
+// temporarily locked accounts.
 func KeysListHandler(c *gin.Context) {
 	config.ConfigInstance.RwMutx.RLock()
-	defer config.ConfigInstance.RwMutx.RUnlock()
-
-	resp := keysResponse{Keys: make([]keyInfo, 0, len(config.ConfigInstance.Sessions))}
+	sessions := make([]struct {
+		SessionKey  string
+		DisplayName string
+		ExtraCookie string
+		OrgID       string
+		Disabled    bool
+	}, len(config.ConfigInstance.Sessions))
 	for i := range config.ConfigInstance.Sessions {
 		s := &config.ConfigInstance.Sessions[i]
-		resp.Keys = append(resp.Keys, keyInfo{
+		sessions[i] = struct {
+			SessionKey  string
+			DisplayName string
+			ExtraCookie string
+			OrgID       string
+			Disabled    bool
+		}{s.SessionKey, s.DisplayName, s.ExtraCookie, s.OrgID, s.Disabled}
+	}
+	config.ConfigInstance.RwMutx.RUnlock()
+
+	resp := keysResponse{Keys: make([]keyInfo, 0, len(sessions))}
+	for _, s := range sessions {
+		ki := keyInfo{
 			Masked:      maskKey(s.SessionKey),
 			Full:        s.SessionKey,
 			DisplayName: s.DisplayName,
 			HasCookie:   s.ExtraCookie != "",
 			HasOrgID:    s.OrgID != "",
 			Disabled:    s.Disabled,
-		})
+		}
+		if until, rem, reason, limited := config.SessionLimited(s.SessionKey); limited {
+			ki.Limited = true
+			ki.LimitedUntil = until.Format("15:04:05")
+			ki.LimitedRemaining = int64(rem.Seconds())
+			ki.LimitReason = reason
+		}
+		resp.Keys = append(resp.Keys, ki)
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -191,6 +222,23 @@ func ToolsSetHandler(c *gin.Context) {
 		logger.Error(fmt.Sprintf("Failed to persist ENABLE_TOOLS to .env: %v", err))
 	}
 	c.JSON(http.StatusOK, gin.H{"enableTools": body.Enabled})
+}
+
+// KeyUnlockHandler manually releases a usage-limit lock before its countdown
+// ends (e.g. the quota recovered early). Body: {"key": "<full session key>"}
+func KeyUnlockHandler(c *gin.Context) {
+	var body struct {
+		Key string `json:"key"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Key) == "" {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"key\": \"<full session key>\"}"})
+		return
+	}
+	if !config.UnlockLimitSession(strings.TrimSpace(body.Key)) {
+		c.JSON(http.StatusNotFound, ErrorResponse{Error: "Account is not limit-locked"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Account unlocked"})
 }
 
 // KeyToggleHandler enables/disables an account; disabled accounts are skipped

@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -770,10 +771,17 @@ func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Cont
 		return "", 500, fmt.Errorf("request failed: %w", err)
 	}
 	logger.Info(fmt.Sprintf("Claude response status code: %d", resp.StatusCode))
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return "", http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded")
-	}
 	if resp.StatusCode != http.StatusOK {
+		bodySnippet := readErrorSnippet(resp)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if bodySnippet != "" {
+				return "", http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded: %s", bodySnippet)
+			}
+			return "", http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded")
+		}
+		if bodySnippet != "" {
+			return "", resp.StatusCode, fmt.Errorf("unexpected status code: %d: %s", resp.StatusCode, bodySnippet)
+		}
 		return "", resp.StatusCode, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 	c.model = model // remember trimmed model for cleanup calls
@@ -836,10 +844,17 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 		return 500, fmt.Errorf("request failed: %w", err)
 	}
 	logger.Info(fmt.Sprintf("Claude response status code: %d", resp.StatusCode))
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded")
-	}
 	if resp.StatusCode != http.StatusOK {
+		bodySnippet := readErrorSnippet(resp)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if bodySnippet != "" {
+				return http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded: %s", bodySnippet)
+			}
+			return http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded")
+		}
+		if bodySnippet != "" {
+			return resp.StatusCode, fmt.Errorf("unexpected status code: %d: %s", resp.StatusCode, bodySnippet)
+		}
 		return resp.StatusCode, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 	if err := c.HandleResponse(resp.Body, stream, gc); err != nil {
@@ -1244,4 +1259,331 @@ func (c *Client) UpdateUserSetting(key string, value interface{}) error {
 
 	// logger.Info(fmt.Sprintf("Successfully updated user setting %s: %s", key, resp.String()))
 	return nil
+}
+
+// readErrorSnippet reads up to 8KB of a failed upstream response for limit
+// detection and closes the body. The Retry-After header (seconds or HTTP
+// date, when claude.ai sends one on 429) is prepended as "retry-after: ..."
+// so ParseLimitReset can turn it into the exact lock duration instead of the
+// DefaultLimitTTL fallback. Returns "" when there is nothing useful.
+func readErrorSnippet(resp *req.Response) string {
+	retryAfter := ""
+	if resp != nil {
+		// Response embeds *http.Response, so Header is available even with
+		// DisableAutoReadResponse; GetHeader is the req wrapper equivalent.
+		if h := resp.GetHeader("Retry-After"); h != "" {
+			retryAfter = strings.TrimSpace(h)
+		} else if resp.Response != nil && resp.Response.Header != nil {
+			if h := resp.Response.Header.Get("Retry-After"); h != "" {
+				retryAfter = strings.TrimSpace(h)
+			}
+		}
+	}
+	if resp == nil || resp.Body == nil {
+		if retryAfter != "" {
+			return "retry-after: " + retryAfter
+		}
+		return ""
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if err != nil && len(b) == 0 {
+		if retryAfter != "" {
+			return "retry-after: " + retryAfter
+		}
+		return ""
+	}
+	s := strings.TrimSpace(string(b))
+	// Single-line it so it fits in logs/errors; keep the "resets ..." tail
+	// because ParseLimitReset needs it.
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 2000 {
+		s = s[:2000] + "…"
+	}
+	if retryAfter != "" {
+		if s != "" {
+			return "retry-after: " + retryAfter + " " + s
+		}
+		return "retry-after: " + retryAfter
+	}
+	return s
+}
+
+// IsUsageLimitMessage reports whether an upstream error text means the account
+// hit its Claude message quota, e.g. "You've hit your limit for Claude
+// messages", "You've hit your session limit · resets 3:45pm",
+// "Claude usage limit reached. Your limit will reset at 3pm
+// (America/Santiago)", "5-hour limit reached - resets ...". Matching is
+// intentionally broad (and case-insensitive) because claude.ai varies the
+// wording by plan/tier.
+func IsUsageLimitMessage(s string) bool {
+	lower := strings.ToLower(s)
+	patterns := []string{
+		"you've hit", "you have hit", "you have reached",
+		"hit your limit", "hit your session limit", "hit your weekly",
+		"hit your opus", "hit your sonnet", "hit your sonnet limit",
+		"message limit", "usage limit", "5-hour limit", "5 hour limit",
+		"session limit", "weekly limit", "opus limit", "sonnet limit",
+		"quota exceeded", "rate limit exceeded",
+		"limit reached", "limit resets", "limit will reset", "will reset at", "reset at",
+		"resets at", "regain access", "spend limit", "enforced_spend_limit",
+	}
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	limitInRe      = regexp.MustCompile(`(?i)resets?\s+(?:in\s+)?(\d+)\s*(second|minute|hour|day|week)s?`)
+	limitAtRe      = regexp.MustCompile(`(?i)(?:will\s+)?resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([^)]+)\))?`)
+	limitAt24Re    = regexp.MustCompile(`(?i)(?:will\s+)?resets?\s+(?:at\s+)?(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:\(([^)]+)\)|UTC|GMT)?`)
+	limitWeekRe    = regexp.MustCompile(`(?i)resets?\s+(?:at\s+)?(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([^)]+)\))?`)
+	limitDateRe    = regexp.MustCompile(`(?i)regain access on\s+(\d{4})-(\d{2})-(\d{2})\s+at\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(UTC|GMT)?`)
+	limitEpochRe   = regexp.MustCompile(`(?i)"?(resets_at|reset_at|resetsAt|resetAt|retry_after|retryAfter)"?\s*[:=]\s*"?(\d{10,13})"?`)
+	limitRetryRe   = regexp.MustCompile(`(?i)retry-after:\s*(\d+)`)
+	weekdayIndex   = map[string]time.Weekday{
+		"mon": time.Monday, "tue": time.Tuesday, "wed": time.Wednesday,
+		"thu": time.Thursday, "fri": time.Friday, "sat": time.Saturday, "sun": time.Sunday,
+	}
+	maxLimitLock = 31 * 24 * time.Hour
+)
+
+// ParseLimitReset extracts how long the account stays limited from an upstream
+// signal, preferring exact machine-readable values first:
+//  1. JSON epoch (resets_at/reset_at/retry_after, seconds or ms),
+//  2. Retry-After header seconds ("retry-after: 120"),
+//  3. "resets in N minutes/hours/days",
+//  4. absolute date ("regain access on 2026-09-01 at 00:00 UTC"),
+//  5. weekday ("resets Mon 12:00am (UTC)"),
+//  6. wall time with timezone ("resets 10pm (America/New_York)",
+//     "Your limit will reset at 3pm (America/Santiago)").
+//
+// The timezone in parentheses is honored via IANA location, so the countdown
+// matches claude.ai's reset instant even when the server runs in another zone.
+// Returns 0 when nothing parseable is found; callers fall back to a default
+// TTL. Result is capped at 31 days (monthly spend cap).
+func ParseLimitReset(msg string) time.Duration {
+	now := time.Now()
+	if m := limitEpochRe.FindStringSubmatch(msg); m != nil {
+		if d := durationFromEpoch(m[2], now); d > 0 {
+			return minDuration(d, maxLimitLock)
+		}
+	}
+	if m := limitRetryRe.FindStringSubmatch(msg); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return minDuration(time.Duration(n)*time.Second, maxLimitLock)
+		}
+	} else if d, ok := durationFromRetryDate(msg, now); ok {
+		return minDuration(d, maxLimitLock)
+	}
+	if m := limitInRe.FindStringSubmatch(msg); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		if n <= 0 {
+			return 0
+		}
+		var d time.Duration
+		switch strings.ToLower(m[2])[:1] {
+		case "s":
+			d = time.Duration(n) * time.Second
+		case "m":
+			d = time.Duration(n) * time.Minute
+		case "d":
+			d = time.Duration(n) * 24 * time.Hour
+		case "w":
+			d = time.Duration(n) * 7 * 24 * time.Hour
+		default:
+			d = time.Duration(n) * time.Hour
+		}
+		return minDuration(d, maxLimitLock)
+	}
+	if m := limitDateRe.FindStringSubmatch(msg); m != nil {
+		if target, ok := timeForDate(m[1], m[2], m[3], m[4], m[5]); ok && target.After(now) {
+			return minDuration(target.Sub(now), maxLimitLock)
+		}
+	}
+	if m := limitWeekRe.FindStringSubmatch(msg); m != nil {
+		wd := weekdayIndex[strings.ToLower(m[1])[:3]]
+		target := timeForWeekday(now, wd, m[2], m[3], m[4], tzLocation(m[5]))
+		if target.After(now) {
+			return minDuration(target.Sub(now), maxLimitLock)
+		}
+		return 0
+	}
+	// 24h "resets at 15:00 (UTC)" must be tried before the 12h pattern, whose
+	// optional am/pm would otherwise mis-split "15:00" into hour=15 + min="".
+	if m := limitAt24Re.FindStringSubmatch(msg); m != nil && m[1] != "" {
+		if h, err := strconv.Atoi(m[1]); err == nil && h >= 13 && h <= 23 {
+			if target, ok := timeFor24h(now, m[1], m[2], tzLocation(m[4])); ok {
+				if target.After(now) {
+					return minDuration(target.Sub(now), maxLimitLock)
+				}
+				if target = target.Add(24 * time.Hour); target.After(now) {
+					return minDuration(target.Sub(now), maxLimitLock)
+				}
+			}
+		}
+	}
+	if m := limitAtRe.FindStringSubmatch(msg); m != nil {
+		loc := tzLocation(m[4])
+		target := timeForToday(now, m[1], m[2], m[3], loc)
+		if target.After(now) {
+			return minDuration(target.Sub(now), maxLimitLock)
+		}
+		// Passed today → same time tomorrow (in the message's zone).
+		target = target.Add(24 * time.Hour)
+		if target.After(now) {
+			return minDuration(target.Sub(now), maxLimitLock)
+		}
+	}
+	return 0
+}
+
+// durationFromEpoch turns a 10-digit (seconds) or 13-digit (ms) unix timestamp
+// from a resets_at-style JSON field into a wait duration. 0 when expired.
+func durationFromEpoch(digits string, now time.Time) time.Duration {
+	n, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if len(digits) > 10 {
+		n /= 1000
+	}
+	target := time.Unix(n, 0)
+	if !target.After(now) {
+		return 0
+	}
+	return target.Sub(now)
+}
+
+// durationFromRetryDate handles a "retry-after: <HTTP date>" header value.
+func durationFromRetryDate(msg string, now time.Time) (time.Duration, bool) {
+	idx := strings.Index(strings.ToLower(msg), "retry-after:")
+	if idx < 0 {
+		return 0, false
+	}
+	rest := strings.TrimSpace(msg[idx+len("retry-after:"):])
+	if rest == "" || (rest[0] >= '0' && rest[0] <= '9') {
+		return 0, false // numeric form is handled by limitRetryRe
+	}
+	// Date runs to the GMT token ("Wed, 21 Oct 2015 07:28:00 GMT").
+	end := strings.Index(rest, "GMT")
+	if end < 0 {
+		return 0, false
+	}
+	dateStr := strings.TrimSpace(rest[:end+3])
+	if t, err := time.Parse(time.RFC1123, dateStr); err == nil && t.After(now) {
+		return t.Sub(now), true
+	}
+	if t, err := time.Parse("Mon, 02 Jan 2006 15:04:05 GMT", dateStr); err == nil && t.After(now) {
+		return t.Sub(now), true
+	}
+	return 0, false
+}
+
+// tzLocation resolves the IANA zone from "(America/New_York)"-style suffixes.
+// Unknown/empty zones fall back to the server's local zone; UTC/GMT map to UTC.
+func tzLocation(raw string) *time.Location {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return time.Local
+	}
+	if strings.EqualFold(name, "UTC") || strings.EqualFold(name, "GMT") || strings.EqualFold(name, "Z") {
+		return time.UTC
+	}
+	// Parenthesized value may carry extra words; take the slash-bearing token.
+	for _, tok := range strings.Fields(name) {
+		clean := strings.Trim(tok, "(),")
+		if strings.Contains(clean, "/") {
+			if loc, err := time.LoadLocation(clean); err == nil {
+				return loc
+			}
+		}
+	}
+	if loc, err := time.LoadLocation(name); err == nil {
+		return loc
+	}
+	return time.Local
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func parseClock(hourStr, minStr, ampm string) (int, int) {
+	h, _ := strconv.Atoi(hourStr)
+	mn := 0
+	if minStr != "" {
+		mn, _ = strconv.Atoi(minStr)
+	}
+	ap := strings.ToLower(ampm)
+	if ap == "am" && h == 12 {
+		h = 0
+	} else if ap == "pm" && h < 12 {
+		h += 12
+	}
+	return h, mn
+}
+
+func timeForToday(now time.Time, hourStr, minStr, ampm string, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = now.Location()
+	}
+	inZone := now.In(loc)
+	h, mn := parseClock(hourStr, minStr, ampm)
+	return time.Date(inZone.Year(), inZone.Month(), inZone.Day(), h, mn, 0, 0, loc)
+}
+
+func timeFor24h(now time.Time, hourStr, minStr string, loc *time.Location) (time.Time, bool) {
+	if loc == nil {
+		loc = now.Location()
+	}
+	h, err1 := strconv.Atoi(hourStr)
+	mn, err2 := strconv.Atoi(minStr)
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || mn < 0 || mn > 59 {
+		return time.Time{}, false
+	}
+	inZone := now.In(loc)
+	return time.Date(inZone.Year(), inZone.Month(), inZone.Day(), h, mn, 0, 0, loc), true
+}
+
+func timeForDate(yearStr, monStr, dayStr, hourStr, minStr string) (time.Time, bool) {
+	y, err1 := strconv.Atoi(yearStr)
+	mo, err2 := strconv.Atoi(monStr)
+	d, err3 := strconv.Atoi(dayStr)
+	h, err4 := strconv.Atoi(hourStr)
+	mn, err5 := strconv.Atoi(minStr)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil || err5 != nil {
+		return time.Time{}, false
+	}
+	return time.Date(y, time.Month(mo), d, h, mn, 0, 0, time.UTC), true
+}
+
+func timeForWeekday(now time.Time, wd time.Weekday, hourStr, minStr, ampm string, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = now.Location()
+	}
+	inZone := now.In(loc)
+	h, mn := parseClock(hourStr, minStr, ampm)
+	delta := (int(wd) - int(inZone.Weekday()) + 7) % 7
+	day := inZone.AddDate(0, 0, delta)
+	t := time.Date(day.Year(), day.Month(), day.Day(), h, mn, 0, 0, loc)
+	if delta == 0 && !t.After(now) {
+		t = t.AddDate(0, 0, 7)
+	}
+	return t
+}
+
+// LimitReasonSnippet shortens an upstream limit message for dashboard storage.
+func LimitReasonSnippet(msg string) string {
+	s := strings.Join(strings.Fields(msg), " ")
+	if len(s) > 200 {
+		return s[:200] + "…"
+	}
+	return s
 }

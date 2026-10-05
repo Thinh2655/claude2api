@@ -79,15 +79,32 @@ func pickSession() config.SessionInfo {
 	if len(sessions) == 0 {
 		return config.SessionInfo{}
 	}
+	usable := func(s config.SessionInfo) bool {
+		if s.Disabled {
+			return false
+		}
+		if _, _, _, limited := config.SessionLimited(s.SessionKey); limited {
+			return false
+		}
+		return true
+	}
 	if gw := config.ConfigInstance.GetGatewayKey(); gw != "" {
 		for i := range sessions {
 			if sessions[i].SessionKey == gw {
-				return sessions[i]
+				if usable(sessions[i]) {
+					return sessions[i]
+				}
+				break
 			}
 		}
 	}
 	for i := range sessions {
-		if sessions[i].ExtraCookie != "" {
+		if sessions[i].ExtraCookie != "" && usable(sessions[i]) {
+			return sessions[i]
+		}
+	}
+	for i := range sessions {
+		if usable(sessions[i]) {
 			return sessions[i]
 		}
 	}

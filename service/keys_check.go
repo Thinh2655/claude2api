@@ -88,6 +88,9 @@ func checkOneAccount(s config.SessionInfo) KeyCheckResult {
 	}
 	switch resp.StatusCode {
 	case http.StatusOK:
+		// Account recovered: clear any stale usage-limit lock so round-robin
+		// picks it up again immediately.
+		config.UnlockLimitSession(s.SessionKey)
 		// Account is reachable: fetch its email to use as the display name,
 		// persisting it so the UI shows a label without a follow-up request.
 		if email := fetchAccountEmail(client); email != "" {
@@ -101,6 +104,11 @@ func checkOneAccount(s config.SessionInfo) KeyCheckResult {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return KeyCheckResult{Key: s.SessionKey, Label: label, Status: "invalid", Detail: fmt.Sprintf("claude.ai returned %d (cookie expired or revoked)", resp.StatusCode)}
 	case http.StatusTooManyRequests:
+		// Organizations 429 means the quota is exhausted: lock the account so
+		// chat requests skip it instead of wasting an upstream call. Short TTL
+		// here (org quota resets in ~2 min) — completion-limit locks from the
+		// chat path use the parsed "resets ..." time instead.
+		config.LockLimitSession(s.SessionKey, "organizations 429 (quota exhausted)", 3*time.Minute)
 		return KeyCheckResult{Key: s.SessionKey, Label: label, Status: "rate_limited", Detail: "claude.ai returned 429 (quota exhausted, resets in ~2 min)"}
 	default:
 		return KeyCheckResult{Key: s.SessionKey, Label: label, Status: "error", Detail: fmt.Sprintf("claude.ai returned %d", resp.StatusCode)}

@@ -24,6 +24,7 @@ func SetupRoutes(r *gin.Engine) {
 		authedKeys.POST("/add", service.KeyAddHandler)
 		authedKeys.POST("/delete", service.KeyDeleteHandler)
 		authedKeys.POST("/toggle", service.KeyToggleHandler)
+		authedKeys.POST("/unlock", service.KeyUnlockHandler)
 		authedKeys.GET("/gateway", service.GatewayKeyGetHandler)
 		authedKeys.POST("/gateway", service.GatewayKeySetHandler)
 		authedKeys.GET("/tools", service.ToolsGetHandler)

@@ -247,6 +247,99 @@ func ClearCooldown() {
 	cooldownMu.Unlock()
 }
 
+// Usage-limit lock: when claude.ai reports "You've hit your limit for Claude
+// messages" (HTTP 429 or an SSE error event with that text) the account is
+// locked until the upstream quota resets, so later requests skip it entirely
+// instead of wasting an upstream call that is guaranteed to fail. Cooldown
+// (30s) only deprioritizes; a limit lock skips the account in round-robin.
+const DefaultLimitTTL = 60 * time.Minute
+
+type limitEntry struct {
+	until  time.Time
+	reason string
+}
+
+var (
+	limitMu sync.Mutex
+	limitAt = map[string]limitEntry{}
+)
+
+// LockLimitSession locks the account for ttl with a human reason (upstream
+// message snippet). ttl <= 0 falls back to DefaultLimitTTL.
+func LockLimitSession(sessionKey, reason string, ttl time.Duration) time.Time {
+	if ttl <= 0 {
+		ttl = DefaultLimitTTL
+	}
+	until := time.Now().Add(ttl)
+	limitMu.Lock()
+	limitAt[sessionKey] = limitEntry{until: until, reason: reason}
+	limitMu.Unlock()
+	return until
+}
+
+// LockLimitSessionUntil locks the account until an absolute time. Past times
+// are ignored; returns false when nothing was stored.
+func LockLimitSessionUntil(sessionKey, reason string, until time.Time) bool {
+	if time.Until(until) <= 0 {
+		return false
+	}
+	limitMu.Lock()
+	// Keep the furthest lock so a short re-lock never shortens a weekly limit.
+	if cur, ok := limitAt[sessionKey]; ok && cur.until.After(until) {
+		limitMu.Unlock()
+		return true
+	}
+	limitAt[sessionKey] = limitEntry{until: until, reason: reason}
+	limitMu.Unlock()
+	return true
+}
+
+// SessionLimited reports whether the account is currently limit-locked, with
+// the unlock time and remaining wait. Expired entries are dropped.
+func SessionLimited(sessionKey string) (until time.Time, remaining time.Duration, reason string, ok bool) {
+	limitMu.Lock()
+	defer limitMu.Unlock()
+	e, found := limitAt[sessionKey]
+	if !found {
+		return time.Time{}, 0, "", false
+	}
+	rem := time.Until(e.until)
+	if rem <= 0 {
+		delete(limitAt, sessionKey)
+		return time.Time{}, 0, "", false
+	}
+	return e.until, rem, e.reason, true
+}
+
+// SessionLimitRemaining is SessionLimited without the extra fields, for
+// round-robin hot paths.
+func SessionLimitRemaining(sessionKey string) time.Duration {
+	_, rem, _, ok := SessionLimited(sessionKey)
+	if !ok {
+		return 0
+	}
+	return rem
+}
+
+// UnlockLimitSession manually releases a limit lock (dashboard "Mở khóa").
+// Returns true when a lock existed.
+func UnlockLimitSession(sessionKey string) bool {
+	limitMu.Lock()
+	defer limitMu.Unlock()
+	if _, ok := limitAt[sessionKey]; !ok {
+		return false
+	}
+	delete(limitAt, sessionKey)
+	return true
+}
+
+// ClearLimits forgets every limit lock (tests only).
+func ClearLimits() {
+	limitMu.Lock()
+	limitAt = map[string]limitEntry{}
+	limitMu.Unlock()
+}
+
 func (sr *SessionRagen) NextIndex() int {
 	sr.Mutex.Lock()
 	defer sr.Mutex.Unlock()

@@ -156,7 +156,22 @@ const headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer '
 // results from the last claude.ai validation, keyed by full session key
 const checkResults = {};
 
+function fmtCountdown(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(s).padStart(2, '0');
+  if (h > 0) return h + ':' + mm + ':' + ss;
+  return m + ':' + ss;
+}
+
 function statusBadge(k) {
+  // Usage-limit lock from the server (chat flow or /check 429) takes priority:
+  // it carries the live countdown, unlike the one-shot manual check result.
+  if (k.limited) {
+    const tip = (k.limitReason || "You've hit your limit") + (k.limitedUntil ? ' · mở lại lúc ' + k.limitedUntil : '');
+    return '<span class="badge limited" title="' + escapeHtml(tip) + '">Tạm khóa <span class="countdown" data-rem="' +
+      (k.limitedRemaining || 0) + '">' + fmtCountdown(k.limitedRemaining) + '</span></span>';
+  }
   const cr = checkResults[k.full];
   if (cr) {
     if (cr.status === 'valid')
@@ -166,6 +181,23 @@ function statusBadge(k) {
     return '<span class="badge limited" style="background:rgba(248,113,113,.15); color:var(--err);" title="' + escapeHtml(cr.detail || '') + '">Lỗi/Hết hiệu lực</span>';
   }
   return '<span class="badge limited" style="background:rgba(139,144,163,.15); color:var(--muted);">Chưa kiểm tra</span>';
+}
+
+// Tick every .countdown badge each second so the "mở lại sau" timer counts
+// down live between the 15s server refreshes. When one hits zero the lock has
+// likely expired server-side, so refresh the list to pick up the new state.
+function tickCountdowns() {
+  let expired = false;
+  document.querySelectorAll('.countdown').forEach(function(el) {
+    let rem = parseInt(el.getAttribute('data-rem') || '0', 10);
+    if (rem > 0) {
+      rem -= 1;
+      el.setAttribute('data-rem', String(rem));
+      el.textContent = fmtCountdown(rem);
+      if (rem <= 0) expired = true;
+    }
+  });
+  if (expired) loadKeys();
 }
 
 function label(k) {
@@ -184,19 +216,32 @@ async function loadKeys() {
   const data = await res.json();
   const tbody = document.getElementById('keysBody');
   tbody.innerHTML = '';
+  let limitedCount = 0;
   for (const k of data.keys) {
+    if (k.limited) limitedCount++;
     const tr = document.createElement('tr');
     const checked = k.full === gatewayKey ? ' checked' : '';
+    const locked = !!k.limited;
+    const unusable = k.disabled || locked;
+    let actions =
+        '<button class="btn-danger" style="margin-right:.4rem;" onclick="checkKeys(\'' + escapeHtml(k.full) + '\')">Kiểm tra</button>';
+    if (locked) {
+      actions += '<button style="margin-right:.4rem; background:rgba(74,222,128,.15); color:var(--ok);" onclick="unlockAccount(\'' + escapeHtml(k.full) + '\')">Mở khóa</button>';
+    }
+    actions += '<button class="btn-danger" onclick="deleteAccount(\'' + escapeHtml(k.full) + '\')">Xóa</button>';
     tr.innerHTML =
-      '<td><code' + (k.disabled ? ' style="opacity:.45; text-decoration:line-through;"' : '') + '>' + escapeHtml(label(k)) + '</code></td>' +
+      '<td><code' + (k.disabled ? ' style="opacity:.45; text-decoration:line-through;"' : '') + '>' + escapeHtml(label(k)) + '</code>' +
+      (locked && k.limitedUntil ? '<div class="hint" style="margin-top:.2rem;">mở lại lúc ' + escapeHtml(k.limitedUntil) + '</div>' : '') + '</td>' +
       '<td>' + statusBadge(k) + '</td>' +
-      '<td style="text-align:center;"><input type="radio" name="gw" value="' + escapeHtml(k.full) + '"' + checked + (k.disabled ? ' disabled' : '') + ' onchange="saveGatewayKey(this.value)"></td>' +
+      '<td style="text-align:center;"><input type="radio" name="gw" value="' + escapeHtml(k.full) + '"' + checked + (unusable ? ' disabled' : '') + ' onchange="saveGatewayKey(this.value)"></td>' +
       '<td style="text-align:center;"><input type="checkbox"' + (k.disabled ? ' checked' : '') + ' onchange="toggleAccount(this, \'' + escapeHtml(k.full) + '\')"></td>' +
-      '<td style="text-align:right; white-space:nowrap;">' +
-        '<button class="btn-danger" style="margin-right:.4rem;" onclick="checkKeys(\'' + escapeHtml(k.full) + '\')">Kiểm tra</button>' +
-        '<button class="btn-danger" onclick="deleteAccount(\'' + escapeHtml(k.full) + '\')">Xóa</button>' +
-      '</td>';
+      '<td style="text-align:right; white-space:nowrap;">' + actions + '</td>';
     tbody.appendChild(tr);
+  }
+  const listMsg = document.getElementById('listMsg');
+  if (limitedCount > 0 && !listMsg.textContent) {
+    listMsg.textContent = limitedCount + ' tài khoản đang tạm khóa (limit) — request sẽ bỏ qua các acc này tới khi đếm ngược xong';
+    listMsg.className = 'msg error';
   }
 
   // keep the gateway selection in sync with the server once on load
@@ -319,6 +364,19 @@ async function deleteAccount(key) {
   loadKeys();
 }
 
+async function unlockAccount(key) {
+  const msg = document.getElementById('listMsg');
+  const res = await fetch('/keys/api/unlock', {
+    method: 'POST', headers,
+    body: JSON.stringify({ key })
+  });
+  const data = await res.json();
+  msg.textContent = data.message || data.error;
+  msg.className = res.ok ? 'msg success' : 'msg error';
+  delete checkResults[key];
+  loadKeys();
+}
+
 async function loadRecentOnce() {
   try {
     const res = await fetch('/keys/api/recent', { headers });
@@ -396,6 +454,7 @@ loadKeys();
 loadTools();
 loadRecentOnce();
 setInterval(loadKeys, 15000);
+setInterval(tickCountdowns, 1000);
 </script>
 </body>
 </html>`

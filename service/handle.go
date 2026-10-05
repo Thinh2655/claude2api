@@ -105,6 +105,7 @@ func ChatCompletionsHandler(c *gin.Context) {
 	order := roundRobinOrder(config.ConfigInstance.Sessions, config.Sr.NextIndex())
 
 	var lastStatus int
+	var lastErrMsg string
 	for _, index := range order {
 		session, err := config.ConfigInstance.GetSessionForModel(index)
 		if err != nil {
@@ -119,12 +120,15 @@ func ChatCompletionsHandler(c *gin.Context) {
 		}
 		logger.Info(fmt.Sprintf("Using account for model %s: %s", model, label))
 		// Initialize client and process request
-		st, ok := handleChatRequest(c, session, model, processor, req.Stream)
+		st, ok, errMsg := handleChatRequest(c, session, model, processor, req.Stream)
 		if ok {
 			return // Success, exit the retry loop
 		}
 		if st != 0 {
 			lastStatus = st
+		}
+		if errMsg != "" {
+			lastErrMsg = errMsg
 		}
 
 		// Client disconnected - no point in retrying
@@ -135,16 +139,53 @@ func ChatCompletionsHandler(c *gin.Context) {
 		default:
 		}
 
-		// Park the failing account so later requests skip it for a while
-		// instead of wasting time on a session that just rate-limited.
-		config.CooldownSession(session.SessionKey)
+		// Usage-limit hit ("You've hit your limit for Claude messages", 429,
+		// session/weekly reset): lock the account until reset instead of the
+		// short 30s cooldown, so later requests skip it entirely and don't
+		// waste an upstream call that is guaranteed to fail.
+		if isLimitFailure(st, errMsg) {
+			ttl := core.ParseLimitReset(errMsg)
+			if ttl <= 0 {
+				ttl = config.DefaultLimitTTL
+				logger.Info(fmt.Sprintf("Limit message has no parseable reset time, fallback %s: %s", ttl, core.LimitReasonSnippet(errMsg)))
+			}
+			reason := core.LimitReasonSnippet(errMsg)
+			if reason == "" {
+				reason = http.StatusText(st)
+			}
+			until := config.LockLimitSession(session.SessionKey, reason, ttl)
+			logger.Info(fmt.Sprintf("Account %s hit usage limit, locked until %s (%s)", label, until.Format("15:04:05"), reason))
+		} else {
+			// Park the failing account so later requests skip it for a while
+			// instead of wasting time on a session that just rate-limited.
+			config.CooldownSession(session.SessionKey)
+		}
 		logger.Info("Retrying another session")
 	}
 
 	if len(order) == 0 {
+		if rem, until, ok := minLimitWait(); ok {
+			c.JSON(http.StatusTooManyRequests, ErrorResponse{
+				Error: fmt.Sprintf("All accounts are temporarily limited (earliest reset in %s at %s)", formatWait(rem), until.Format("15:04:05")),
+			})
+			return
+		}
 		lastStatus = http.StatusServiceUnavailable
 	}
 	logger.Error("Failed for all retries")
+	// A limit failure that surfaced as SSE error (status 500 + limit text) is
+	// still a quota problem for the client: report 429 so callers back off
+	// instead of treating it as a generic server error.
+	if isLimitFailure(lastStatus, lastErrMsg) {
+		msg := "All accounts hit usage limit"
+		if lastErrMsg != "" {
+			msg += ": " + core.LimitReasonSnippet(lastErrMsg)
+		} else if rem, until, ok := minLimitWait(); ok {
+			msg = fmt.Sprintf("All accounts are temporarily limited (earliest reset in %s at %s)", formatWait(rem), until.Format("15:04:05"))
+		}
+		c.JSON(http.StatusTooManyRequests, ErrorResponse{Error: msg})
+		return
+	}
 	finalStatus := http.StatusInternalServerError
 	finalMsg := "Failed to process request after multiple attempts"
 	if lastStatus != 0 && lastStatus != http.StatusOK {
@@ -194,7 +235,25 @@ func MirrorChatHandler(c *gin.Context) {
 	}
 
 	// Process the request with the provided session
-	if status, ok := handleChatRequest(c, session, model, processor, req.Stream); !ok {
+	if status, ok, errMsg := handleChatRequest(c, session, model, processor, req.Stream); !ok {
+		if isLimitFailure(status, errMsg) {
+			ttl := core.ParseLimitReset(errMsg)
+			if ttl <= 0 {
+				ttl = config.DefaultLimitTTL
+			}
+			reason := core.LimitReasonSnippet(errMsg)
+			if reason == "" {
+				reason = http.StatusText(status)
+			}
+			// Mirror uses an explicit session (not the pool), but the lock is
+			// still keyed by sessionKey so the dashboard countdown shows it.
+			if session.SessionKey != "" {
+				config.LockLimitSession(session.SessionKey, reason, ttl)
+			}
+			msg := "Upstream claude.ai usage limit: " + reason
+			c.JSON(http.StatusTooManyRequests, ErrorResponse{Error: msg})
+			return
+		}
 		finalStatus := status
 		finalMsg := "Failed to process request"
 		if finalStatus != 0 && finalStatus != http.StatusOK {
@@ -257,10 +316,12 @@ func extractSessionFromAuthHeader(c *gin.Context) (*config.SessionInfo, error) {
 	return config.NewSessionInfo(authInfo, ""), nil
 }
 
-// roundRobinOrder lists every enabled session index once starting at start,
+// roundRobinOrder lists every usable session index once starting at start,
 // with accounts still in cooldown pushed to the end (so a request that needs a
 // fallback tries a cooling account only when no fresh one remains). Manually
-// disabled accounts are skipped entirely.
+// disabled accounts and usage-limit-locked accounts are skipped entirely, so a
+// request never wastes an upstream call on an account that is guaranteed to
+// answer "You've hit your limit".
 func roundRobinOrder(sessions []config.SessionInfo, start int) []int {
 	n := len(sessions)
 	if n == 0 {
@@ -273,6 +334,9 @@ func roundRobinOrder(sessions []config.SessionInfo, start int) []int {
 		if sessions[idx].Disabled {
 			continue
 		}
+		if _, _, _, limited := config.SessionLimited(sessions[idx].SessionKey); limited {
+			continue
+		}
 		if config.SessionCooling(sessions[idx].SessionKey) {
 			cooling = append(cooling, idx)
 		} else {
@@ -282,7 +346,53 @@ func roundRobinOrder(sessions []config.SessionInfo, start int) []int {
 	return append(fresh, cooling...)
 }
 
-func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) (status int, ok bool) {
+// isLimitFailure reports whether a failed upstream attempt means the account
+// hit its Claude message quota: HTTP 429, or any error text matching the
+// "You've hit your limit" family (completion 4xx with limit body, or an SSE
+// error event before any content was streamed).
+func isLimitFailure(status int, errMsg string) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	return errMsg != "" && core.IsUsageLimitMessage(errMsg)
+}
+
+// minLimitWait returns the shortest remaining lock among limit-locked pool
+// accounts, for "retry after" messages.
+func minLimitWait() (rem time.Duration, until time.Time, ok bool) {
+	config.ConfigInstance.RwMutx.RLock()
+	keys := make([]string, 0, len(config.ConfigInstance.Sessions))
+	for i := range config.ConfigInstance.Sessions {
+		keys = append(keys, config.ConfigInstance.Sessions[i].SessionKey)
+	}
+	config.ConfigInstance.RwMutx.RUnlock()
+	first := true
+	for _, k := range keys {
+		u, r, _, limited := config.SessionLimited(k)
+		if !limited {
+			continue
+		}
+		if first || r < rem {
+			rem, until, ok, first = r, u, true, false
+		}
+	}
+	return rem, until, ok
+}
+
+// formatWait renders a countdown duration as H:MM:SS or M:SS for messages.
+func formatWait(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	s := int(d.Seconds())
+	h, m, sec := s/3600, (s%3600)/60, s%60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, sec)
+	}
+	return fmt.Sprintf("%d:%02d", m, sec)
+}
+
+func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) (status int, ok bool, errMsg string) {
 	start := time.Now()
 	session.Lock()
 	defer session.Unlock()
@@ -293,8 +403,8 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		recordRecent(c, session, model, status, ok, time.Since(start), firstUserText(processor))
 	}()
 
-	fail := func(status int) (int, bool) {
-		return status, false
+	fail := func(status int, msg string) (int, bool, string) {
+		return status, false, msg
 	}
 
 	// Function-calling shim: the web backend has no tools API, so client tool
@@ -328,7 +438,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		orgId, err := claudeClient.GetOrgID()
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to get org ID: %v", err))
-			return fail(http.StatusServiceUnavailable)
+			return fail(http.StatusServiceUnavailable, err.Error())
 		}
 		session.OrgID = orgId
 		config.ConfigInstance.SetSessionOrgID(session.SessionKey, session.OrgID)
@@ -341,7 +451,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		err := claudeClient.UploadFile(processor.ImgDataList)
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to upload file: %v", err))
-			return fail(http.StatusServiceUnavailable)
+			return fail(http.StatusServiceUnavailable, err.Error())
 		}
 	}
 
@@ -358,10 +468,10 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	_, statusCode, err := claudeClient.SendMessageWithCreate(processor.Prompt.String(), stream, c)
 	if err != nil {
 		logger.Error(fmt.Sprintf("Failed to send message: %v", err))
-		return fail(statusCode)
+		return fail(statusCode, err.Error())
 	}
 	if statusCode != http.StatusOK {
-		return fail(statusCode)
+		return fail(statusCode, "")
 	}
 
 	// Clean up conversation if enabled
@@ -369,7 +479,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		go cleanupConversation(claudeClient, conversationID, 3)
 	}
 
-	return statusCode, true
+	return statusCode, true, ""
 }
 
 func cleanupConversation(client *core.Client, conversationID string, retry int) {
