@@ -224,6 +224,29 @@ func ToolsSetHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"enableTools": body.Enabled})
 }
 
+// LastImageGetHandler returns whether only the last message's images are used
+func LastImageGetHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"onlyLastImage": config.ConfigInstance.OnlyLastImageEnabled()})
+}
+
+// LastImageSetHandler toggles "only last message images" and persists it to .env
+func LastImageSetHandler(c *gin.Context) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"enabled\": true|false}"})
+		return
+	}
+	config.ConfigInstance.RwMutx.Lock()
+	config.ConfigInstance.OnlyLastImage = body.Enabled
+	config.ConfigInstance.RwMutx.Unlock()
+	if err := saveEnvLine("ONLY_LAST_IMAGE", fmt.Sprintf("%t", body.Enabled)); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist ONLY_LAST_IMAGE to .env: %v", err))
+	}
+	c.JSON(http.StatusOK, gin.H{"onlyLastImage": body.Enabled})
+}
+
 // KeyUnlockHandler manually releases a usage-limit lock before its countdown
 // ends (e.g. the quota recovered early). Body: {"key": "<full session key>"}
 func KeyUnlockHandler(c *gin.Context) {

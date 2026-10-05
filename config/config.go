@@ -84,6 +84,9 @@ type Config struct {
 	// EnableTools forwards client-requested tools to the model (web_search,
 	// artifacts, repl) and exposes client function tools as OpenAI tool_calls.
 	EnableTools            bool          `yaml:"enableTools"`
+	// OnlyLastImage drops image_url parts from every message except the last
+	// one, so long histories don't re-upload old images on each request.
+	OnlyLastImage          bool          `yaml:"onlyLastImage"`
 	EnableGateway          bool          `yaml:"enableGateway"` // phục vụ giao diện claude.ai tại localhost
 	GatewayKey             string        `yaml:"gatewayKey"`    // sessionKey gateway ưu tiên dùng; rỗng = tự chọn
 	RwMutx                 sync.RWMutex  `yaml:"-"`             // 不从YAML加载
@@ -124,6 +127,14 @@ func (c *Config) ToolsEnabled() bool {
 	c.RwMutx.RLock()
 	defer c.RwMutx.RUnlock()
 	return c.EnableTools
+}
+
+// OnlyLastImageEnabled reports whether only the last message's images are
+// uploaded (safe under the config lock).
+func (c *Config) OnlyLastImageEnabled() bool {
+	c.RwMutx.RLock()
+	defer c.RwMutx.RUnlock()
+	return c.OnlyLastImage
 }
 
 // SetGatewayKey stores the preferred gateway session key
@@ -543,6 +554,8 @@ func loadConfigFromEnv() *Config {
 		EnableGateway: os.Getenv("ENABLE_GATEWAY") == "true",
 		// Bật/tắt hỗ trợ tool (mặc định bật)
 		EnableTools: os.Getenv("ENABLE_TOOLS") != "false",
+		// Chỉ nhận ảnh ở message cuối (mặc định tắt = giữ hành vi cũ)
+		OnlyLastImage: os.Getenv("ONLY_LAST_IMAGE") == "true",
 		// 网关优先使用的 sessionKey（可选）
 		GatewayKey: os.Getenv("GATEWAY_KEY"),
 		// 设置读写锁
@@ -605,4 +618,5 @@ func init() {
 	logger.Info(fmt.Sprintf("MirrorApiPrefix: %s", ConfigInstance.MirrorApiPrefix))
 	logger.Info(fmt.Sprintf("EnableGateway: %t", ConfigInstance.EnableGateway))
 	logger.Info(fmt.Sprintf("EnableTools: %t", ConfigInstance.EnableTools))
+	logger.Info(fmt.Sprintf("OnlyLastImage: %t", ConfigInstance.OnlyLastImage))
 }

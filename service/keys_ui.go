@@ -127,6 +127,17 @@ const keysPageHTML = `<!DOCTYPE html>
       </label>
     </div>
     <div class="msg" id="toolsMsg"></div>
+    <div class="switch-row" style="margin-top:1rem;">
+      <div>
+        <div>Chỉ nhận ảnh ở message cuối</div>
+        <div class="hint">Bật = bỏ qua ảnh ở các message cũ, chỉ upload ảnh của message cuối cùng. Giảm upload/token khi chat dài có ảnh.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="lastImageToggle" onchange="saveLastImage(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="msg" id="lastImageMsg"></div>
   </div>
 
   <div class="card">
@@ -279,6 +290,39 @@ async function saveTools(el) {
       return;
     }
     msg.textContent = 'Đã ' + (data.enableTools ? 'bật' : 'tắt') + ' hỗ trợ tool';
+    msg.className = 'msg success';
+  } catch (e) {
+    el.checked = !el.checked;
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    el.disabled = false;
+  }
+}
+
+async function loadLastImage() {
+  const res = await fetch('/keys/api/last-image', { headers });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('lastImageToggle').checked = !!data.onlyLastImage;
+}
+
+async function saveLastImage(el) {
+  const msg = document.getElementById('lastImageMsg');
+  el.disabled = true;
+  try {
+    const res = await fetch('/keys/api/last-image', {
+      method: 'POST', headers,
+      body: JSON.stringify({ enabled: el.checked })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      el.checked = !el.checked;
+      msg.textContent = data.error || 'Lưu thất bại';
+      msg.className = 'msg error';
+      return;
+    }
+    msg.textContent = 'Đã ' + (data.onlyLastImage ? 'bật' : 'tắt') + ' chỉ nhận ảnh ở message cuối';
     msg.className = 'msg success';
   } catch (e) {
     el.checked = !el.checked;
@@ -452,6 +496,7 @@ async function checkKeys(key) {
 
 loadKeys();
 loadTools();
+loadLastImage();
 loadRecentOnce();
 setInterval(loadKeys, 15000);
 setInterval(tickCountdowns, 1000);

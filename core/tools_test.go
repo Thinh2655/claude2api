@@ -26,8 +26,11 @@ func TestUpstreamTool(t *testing.T) {
 	if got := resolveUpstreamTools(nil, defs); len(got) != 1 {
 		t.Fatal("empty input must keep defaults")
 	}
-	if got := resolveUpstreamTools([]map[string]interface{}{{"name": "nope"}}, defs); len(got) != 1 {
-		t.Fatal("all-unknown input must keep defaults")
+	if got := resolveUpstreamTools([]map[string]interface{}{{"name": "nope"}}, defs); len(got) != 0 {
+		t.Fatal("all-unknown input must strip defaults (custom tools go via prompt)")
+	}
+	if got := resolveUpstreamTools([]map[string]interface{}{{"name": "web_search"}}, defs); len(got) != 1 {
+		t.Fatal("explicit web_search must be kept")
 	}
 }
 

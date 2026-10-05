@@ -179,19 +179,18 @@ func upstreamTool(t map[string]interface{}) map[string]interface{} {
 }
 
 // resolveUpstreamTools converts client-requested tools to the claude.ai tool
-// list. Empty (or all-unknown) client list keeps the defaults.
+// list. Empty client list keeps the defaults; a non-empty list maps each
+// entry and drops unknown function tools (they are described in the prompt
+// via ToolPrompt instead), so no default tool is sent unless explicitly asked.
 func resolveUpstreamTools(clientTools []map[string]interface{}, defaults []map[string]interface{}) []map[string]interface{} {
 	if len(clientTools) == 0 {
 		return defaults
 	}
-	var out []map[string]interface{}
+	out := make([]map[string]interface{}, 0, len(clientTools))
 	for _, t := range clientTools {
 		if u := upstreamTool(t); u != nil {
 			out = append(out, u)
 		}
-	}
-	if len(out) == 0 {
-		return defaults
 	}
 	return out
 }
@@ -598,7 +597,9 @@ func NewClientWithCookie(sessionKey string, proxy string, model string, cookie s
 }
 
 // SetTools overrides the default upstream tool list with the client-requested
-// one. Empty (or all-unknown) input keeps the defaults.
+// one. Empty input keeps the defaults; a non-empty list sends only the mapped
+// tools (possibly none), so custom function tools don't drag along Claude's
+// default web_search/artifacts/repl.
 func (c *Client) SetTools(clientTools []map[string]interface{}) {
 	if len(clientTools) == 0 {
 		return
@@ -757,8 +758,9 @@ func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Cont
 		"is_temporary":                     false,
 	}
 
+	conversationID := newConversationID()
 	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/completion",
-		c.orgID, newConversationID())
+		c.orgID, conversationID)
 
 	resp, err := c.client.R().DisableAutoReadResponse().
 		SetHeader("referer", "https://claude.ai/new").
@@ -788,18 +790,11 @@ func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Cont
 	if err := c.HandleResponse(resp.Body, stream, gc); err != nil {
 		return "", 500, err
 	}
-	return "", 200, nil
+	return conversationID, 200, nil
 }
 
 func newConversationID() string {
 	return uuid.New().String()
-}
-
-// PeekNewConversationID generates the conversation UUID that
-// SendMessageWithCreate will use, so callers can reference it for cleanup
-// before the request completes.
-func (c *Client) PeekNewConversationID() string {
-	return newConversationID()
 }
 
 // SendMessage sends a message to a conversation and returns the status and response

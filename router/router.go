@@ -29,6 +29,8 @@ func SetupRoutes(r *gin.Engine) {
 		authedKeys.POST("/gateway", service.GatewayKeySetHandler)
 		authedKeys.GET("/tools", service.ToolsGetHandler)
 		authedKeys.POST("/tools", service.ToolsSetHandler)
+		authedKeys.GET("/last-image", service.LastImageGetHandler)
+		authedKeys.POST("/last-image", service.LastImageSetHandler)
 		authedKeys.POST("/check", service.KeyCheckHandler)
 		authedKeys.GET("/recent", service.RecentRequestsHandler)
 		authedKeys.GET("/recent/stream", service.RecentStreamHandler)

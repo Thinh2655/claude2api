@@ -28,6 +28,9 @@ maxChatHistoryLength: 10000
 # Tool support: forward client tools upstream + return OpenAI tool_calls (default: true)
 enableTools: true
 
+# Only use images from the last message (default: false = keep old behavior)
+onlyLastImage: false
+
 # Role prefix settings
 noRolePrefix: false
 

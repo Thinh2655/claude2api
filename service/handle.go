@@ -463,9 +463,10 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	}
 
 	// Single-request flow: create_conversation_params embedded in completion,
-	// mirroring the browser payload (halves upstream requests per message)
-	conversationID := claudeClient.PeekNewConversationID()
-	_, statusCode, err := claudeClient.SendMessageWithCreate(processor.Prompt.String(), stream, c)
+	// mirroring the browser payload (halves upstream requests per message).
+	// The call returns the real conversation ID it created, which ChatDelete
+	// cleanup must use (a guessed ID would delete nothing).
+	conversationID, statusCode, err := claudeClient.SendMessageWithCreate(processor.Prompt.String(), stream, c)
 	if err != nil {
 		logger.Error(fmt.Sprintf("Failed to send message: %v", err))
 		return fail(statusCode, err.Error())
