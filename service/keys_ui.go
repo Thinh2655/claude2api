@@ -48,6 +48,7 @@ const keysPageHTML = `<!DOCTYPE html>
   }
   .badge.ok { background: rgba(74,222,128,.15); color: var(--ok); }
   .badge.limited { background: rgba(251,191,36,.15); color: var(--warn); }
+  .badge.cooling { background: rgba(96,165,250,.15); color: #60a5fa; }
   button {
     cursor: pointer; border: none; border-radius: 8px;
     padding: .45rem .9rem; font-size: .85rem; font-weight: 600;
@@ -182,6 +183,12 @@ function statusBadge(k) {
     const tip = (k.limitReason || "You've hit your limit") + (k.limitedUntil ? ' · mở lại lúc ' + k.limitedUntil : '');
     return '<span class="badge limited" title="' + escapeHtml(tip) + '">Tạm khóa <span class="countdown" data-rem="' +
       (k.limitedRemaining || 0) + '">' + fmtCountdown(k.limitedRemaining) + '</span></span>';
+  }
+  // Cooldown ngắn 10s sau mỗi request thành công (hoặc 30s sau fail): acc vẫn
+  // dùng được nhưng bị đẩy xuống cuối round-robin để tránh limit.
+  if (k.cooling) {
+    return '<span class="badge cooling" title="Vừa dùng xong, nghỉ tránh limit — request tới sẽ ưu tiên acc khác">Nghỉ <span class="countdown" data-rem="' +
+      (k.coolingRemaining || 0) + '">' + fmtCountdown(k.coolingRemaining) + '</span></span>';
   }
   const cr = checkResults[k.full];
   if (cr) {
@@ -498,7 +505,7 @@ loadKeys();
 loadTools();
 loadLastImage();
 loadRecentOnce();
-setInterval(loadKeys, 15000);
+setInterval(loadKeys, 3000);
 setInterval(tickCountdowns, 1000);
 </script>
 </body>

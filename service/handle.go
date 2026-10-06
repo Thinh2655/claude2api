@@ -122,6 +122,9 @@ func ChatCompletionsHandler(c *gin.Context) {
 		// Initialize client and process request
 		st, ok, errMsg := handleChatRequest(c, session, model, processor, req.Stream)
 		if ok {
+			// Tạm khóa acc 10s sau request thành công để request kế tiếp
+			// ưu tiên acc khác, tránh hammer 1 acc gây limit.
+			config.CooldownSessionSuccess(session.SessionKey)
 			return // Success, exit the retry loop
 		}
 		if st != 0 {
@@ -265,6 +268,11 @@ func MirrorChatHandler(c *gin.Context) {
 		})
 		return
 	}
+	// Mirror thành công cũng park 10s để lần sau ưu tiên acc khác (nếu acc
+	// nằm trong pool).
+	if session.SessionKey != "" {
+		config.CooldownSessionSuccess(session.SessionKey)
+	}
 }
 
 // Helper functions
@@ -397,10 +405,14 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	session.Lock()
 	defer session.Unlock()
 
+	// Capture the real user prompt for the dashboard before the big-context path
+	// below overwrites processor.Prompt with the "immerse yourself" instruction.
+	preview := firstUserText(processor)
+
 	// Record this attempt in the dashboard's recent-request log no matter which
 	// path the function takes, so the list reflects failures too.
 	defer func() {
-		recordRecent(c, session, model, status, ok, time.Since(start), firstUserText(processor))
+		recordRecent(c, session, model, status, ok, time.Since(start), preview)
 	}()
 
 	fail := func(status int, msg string) (int, bool, string) {

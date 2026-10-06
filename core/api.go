@@ -48,6 +48,11 @@ type ResponseEvent struct {
 		THINKING string `json:"thinking"`
 		// partial_json
 		PartialJSON string `json:"partial_json"`
+		// thinking_summary_delta carries {"summary":{"summary":"..."}} — a
+		// progress note emitted while the model is still thinking.
+		Summary struct {
+			Summary string `json:"summary"`
+		} `json:"summary"`
 	} `json:"delta"`
 	Error struct {
 		Message string `json:"message"`
@@ -891,11 +896,22 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	// as a complete JSON object, so we can extract the code field intact.
 	pendingJSON := ""
 	toolLogEmitted := false
+	// Diagnostic: count the upstream event types, so a 200 with no usable
+	// content (dashboard shows Out ↓ = 0) can be traced to an unhandled delta
+	// type without re-enabling the full SSE dump.
+	seenTypes := map[string]int{}
+	// claude.ai never reports token counts, so estimate the output side from the
+	// assembled text. Deferred so it also fires on the early client-disconnect
+	// return, which would otherwise leave the dashboard showing Out ↓ = 0 even
+	// though content was streamed.
+	defer func() {
+		gc.Set("CompletionTokens", utils.EstimateCompletionTokens(res_all_text+res_reasoning_text))
+	}()
 	for scanner.Scan() {
 		select {
 		case <-clientDone:
 			// 客户端已断开连接，清理资源并退出
-			logger.Info("Client closed connection")
+			logger.Warn(fmt.Sprintf("Client closed connection mid-stream (%d bytes text, %d bytes reasoning), event types: %v", len(res_all_text), len(res_reasoning_text), seenTypes))
 			return nil
 		default:
 			// 继续处理响应
@@ -908,6 +924,11 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 		data := line[6:]
 		var event ResponseEvent
 		if err := json.Unmarshal([]byte(data), &event); err == nil {
+			key := event.Type
+			if event.Delta.Type != "" {
+				key += "/" + event.Delta.Type
+			}
+			seenTypes[key]++
 			if event.Type == "error" && event.Error.Message != "" {
 				if res_all_text != "" {
 					// Content was already streamed to the client; append the
@@ -977,6 +998,22 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				model.ReturnOpenAIReasoningResponse(reasoning, stream, gc)
 				continue
 			}
+			if event.Delta.Type == "thinking_summary_delta" {
+				// Progress note sent while the model is still thinking (e.g.
+				// "Drafting a history essay."). Forward it as reasoning_content
+				// so long thinking turns stream a heartbeat instead of going
+				// silent until the first text_delta (clients otherwise time out).
+				summary := event.Delta.Summary.Summary
+				if summary == "" {
+					continue
+				}
+				res_reasoning_text += summary
+				if !stream {
+					continue
+				}
+				model.ReturnOpenAIReasoningResponse(summary, stream, gc)
+				continue
+			}
 			if event.Delta.Type == "input_json_delta" {
 				// input_json_delta carries a JSON-escaped fragment of a tool_use
 				// input object, e.g. {"command":"...","file_text":"<code>"}.
@@ -1036,9 +1073,11 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("error reading response: %w", err)
 	}
-	// claude.ai never reports token counts, so estimate the output side from
-	// the assembled text for the usage object and the dashboard log.
-	gc.Set("CompletionTokens", utils.EstimateCompletionTokens(res_all_text+res_reasoning_text))
+	// Nothing parsed out of the stream: log the event types seen so an empty
+	// response (Out ↓ = 0) can be diagnosed without re-enabling the SSE dump.
+	if res_all_text == "" && res_reasoning_text == "" {
+		logger.Warn(fmt.Sprintf("Upstream sent no usable content (stream=%t), event types: %v", stream, seenTypes))
+	}
 	if !stream {
 		model.ResponseWithTools(res_all_text, res_reasoning_text, stream, gc)
 	} else {

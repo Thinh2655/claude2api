@@ -27,6 +27,10 @@ type keyInfo struct {
 	LimitedUntil     string `json:"limitedUntil,omitempty"`
 	LimitedRemaining int64  `json:"limitedRemaining,omitempty"`
 	LimitReason      string `json:"limitReason,omitempty"`
+	// Cooldown ngắn sau mỗi request (10s success / 30s fail): acc vẫn dùng
+	// được nhưng bị đẩy xuống cuối round-robin. Dashboard hiện badge riêng.
+	Cooling          bool  `json:"cooling,omitempty"`
+	CoolingRemaining int64 `json:"coolingRemaining,omitempty"`
 }
 
 type keysResponse struct {
@@ -90,6 +94,10 @@ func KeysListHandler(c *gin.Context) {
 			ki.LimitedUntil = until.Format("15:04:05")
 			ki.LimitedRemaining = int64(rem.Seconds())
 			ki.LimitReason = reason
+		}
+		if rem := config.SessionCooldownRemaining(s.SessionKey); rem > 0 {
+			ki.Cooling = true
+			ki.CoolingRemaining = int64(rem.Seconds()) + 1
 		}
 		resp.Keys = append(resp.Keys, ki)
 	}

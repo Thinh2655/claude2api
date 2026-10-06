@@ -226,15 +226,33 @@ func (c *Config) SetSessionDisplayName(sessionKey, name string) {
 // session needs to cool longer per model tier.
 const sessionCooldownTTL = 30 * time.Second
 
+// successCooldownTTL parks an account briefly after a SUCCESSFUL request so
+// rapid-fire requests rotate to other accounts instead of hammering the same
+// session and tripping claude.ai rate limits.
+const successCooldownTTL = 10 * time.Second
+
 var (
 	cooldownMu sync.Mutex
 	cooldownAt = map[string]time.Time{}
 )
 
-func CooldownSession(sessionKey string) {
+func CooldownSessionWithTTL(sessionKey string, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
 	cooldownMu.Lock()
-	cooldownAt[sessionKey] = time.Now().Add(sessionCooldownTTL)
+	cooldownAt[sessionKey] = time.Now().Add(ttl)
 	cooldownMu.Unlock()
+}
+
+func CooldownSession(sessionKey string) {
+	CooldownSessionWithTTL(sessionKey, sessionCooldownTTL)
+}
+
+// CooldownSessionSuccess parks the account after a successful request (10s)
+// so the next request prefers a fresh account and avoids limit.
+func CooldownSessionSuccess(sessionKey string) {
+	CooldownSessionWithTTL(sessionKey, successCooldownTTL)
 }
 
 func SessionCooling(sessionKey string) bool {
@@ -249,6 +267,24 @@ func SessionCooling(sessionKey string) bool {
 		return false
 	}
 	return true
+}
+
+// SessionCooldownRemaining returns how long the account stays parked (0 when
+// not cooling). Expired entries are dropped. Used by the dashboard so the
+// short 10s post-request park is visible with a live countdown.
+func SessionCooldownRemaining(sessionKey string) time.Duration {
+	cooldownMu.Lock()
+	defer cooldownMu.Unlock()
+	until, ok := cooldownAt[sessionKey]
+	if !ok {
+		return 0
+	}
+	rem := time.Until(until)
+	if rem <= 0 {
+		delete(cooldownAt, sessionKey)
+		return 0
+	}
+	return rem
 }
 
 // ClearCooldown forgets every cooldown (tests only).
