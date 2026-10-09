@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 )
@@ -23,6 +24,7 @@ type recentRequest struct {
 	Ms               int64     `json:"ms"`
 	PromptTokens     int       `json:"promptTokens"`
 	CompletionTokens int       `json:"completionTokens"`
+	Chars            int       `json:"chars"`
 	Preview          string    `json:"preview"`
 }
 
@@ -55,6 +57,7 @@ func recordRecent(c *gin.Context, session *config.SessionInfo, model string, sta
 		Ms:               d.Milliseconds(),
 		PromptTokens:     pt,
 		CompletionTokens: ct,
+		Chars:            utf8.RuneCountInString(prompt),
 		Preview:          strings.TrimSpace(preview),
 	}
 	recentMu.Lock()

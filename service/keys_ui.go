@@ -152,9 +152,9 @@ const keysPageHTML = `<!DOCTYPE html>
   <div class="card">
     <h2>5 request mới nhất</h2>
     <table id="recentTable">
-      <thead><tr><th>Thời gian</th><th>Tài khoản</th><th>Model</th><th style="text-align:right;">In ↑</th><th style="text-align:right;">Out ↓</th><th>Kết quả</th><th>Nội dung</th></tr></thead>
+      <thead><tr><th>Thời gian</th><th>Tài khoản</th><th>Model</th><th style="text-align:right;">In ↑</th><th style="text-align:right;">Out ↓</th><th>Kết quả</th><th style="text-align:right;">Ký tự</th><th>Nội dung</th></tr></thead>
       <tbody id="recentBody">
-        <tr><td colspan="7" style="color:var(--muted);">Chưa có request nào</td></tr>
+        <tr><td colspan="8" style="color:var(--muted);">Chưa có request nào</td></tr>
       </tbody>
     </table>
   </div>
@@ -457,11 +457,12 @@ function renderRecent(requests) {
         '<td style="text-align:right; white-space:nowrap;">' + fmt(r.promptTokens) + ' <span style="color:var(--ok);">↑</span></td>' +
         '<td style="text-align:right; white-space:nowrap;">' + fmt(r.completionTokens) + ' <span style="color:var(--accent);">↓</span></td>' +
         '<td>' + badge + (r.ms ? ' <span style="color:var(--muted);">' + r.ms + 'ms</span>' : '') + '</td>' +
+        '<td style="text-align:right; white-space:nowrap; color:var(--muted);">' + fmt(r.chars) + '</td>' +
         '<td style="color:var(--muted);">' + escapeHtml(r.preview) + '</td></tr>';
     });
     tbody.innerHTML = rows.length
       ? rows.join('')
-      : '<tr><td colspan="7" style="color:var(--muted);">Chưa có request nào</td></tr>';
+      : '<tr><td colspan="8" style="color:var(--muted);">Chưa có request nào</td></tr>';
 }
 
 // loadRecentOnce fetches the table a single time on page load, then opens an
