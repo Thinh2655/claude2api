@@ -232,6 +232,30 @@ func ToolsSetHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"enableTools": body.Enabled})
 }
 
+// MCPGetHandler returns whether MCP tool support is enabled
+func MCPGetHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"enableMCP": config.ConfigInstance.MCPEnabled()})
+}
+
+// MCPSetHandler toggles MCP support and persists it to .env
+func MCPSetHandler(c *gin.Context) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"enabled\": true|false}"})
+		return
+	}
+	config.ConfigInstance.RwMutx.Lock()
+	config.ConfigInstance.EnableMCP = body.Enabled
+	config.ConfigInstance.RwMutx.Unlock()
+	core.ClearMCPCache()
+	if err := saveEnvLine("ENABLE_MCP", fmt.Sprintf("%t", body.Enabled)); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist ENABLE_MCP to .env: %v", err))
+	}
+	c.JSON(http.StatusOK, gin.H{"enableMCP": body.Enabled})
+}
+
 // LastImageGetHandler returns whether only the last message's images are used
 func LastImageGetHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"onlyLastImage": config.ConfigInstance.OnlyLastImageEnabled()})
@@ -386,21 +410,8 @@ func saveEnvLine(name, value string) error {
 		lines = append(lines, newLine)
 	}
 
-	tmp := path + ".tmp"
-	out, err := os.Create(tmp)
-	if err != nil {
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		return err
 	}
-	w := bufio.NewWriter(out)
-	for _, line := range lines {
-		fmt.Fprintln(w, line)
-	}
-	if err := w.Flush(); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return nil
 }

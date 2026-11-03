@@ -139,6 +139,17 @@ const keysPageHTML = `<!DOCTYPE html>
       </label>
     </div>
     <div class="msg" id="lastImageMsg"></div>
+    <div class="switch-row" style="margin-top:1rem;">
+      <div>
+        <div>Hỗ trợ MCP (Model Context Protocol)</div>
+        <div class="hint">Tự động nạp các công cụ MCP server đã cấu hình trên tài khoản vào request completion. Lưu vào cấu hình ENABLE_MCP.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="mcpToggle" onchange="saveMCP(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="msg" id="mcpMsg"></div>
   </div>
 
   <div class="card">
@@ -340,6 +351,39 @@ async function saveLastImage(el) {
   }
 }
 
+async function loadMCP() {
+  const res = await fetch('/keys/api/mcp', { headers });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('mcpToggle').checked = !!data.enableMCP;
+}
+
+async function saveMCP(el) {
+  const msg = document.getElementById('mcpMsg');
+  el.disabled = true;
+  try {
+    const res = await fetch('/keys/api/mcp', {
+      method: 'POST', headers,
+      body: JSON.stringify({ enabled: el.checked })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      el.checked = !el.checked;
+      msg.textContent = data.error || 'Lưu thất bại';
+      msg.className = 'msg error';
+      return;
+    }
+    msg.textContent = 'Đã ' + (data.enableMCP ? 'bật' : 'tắt') + ' hỗ trợ MCP';
+    msg.className = 'msg success';
+  } catch (e) {
+    el.checked = !el.checked;
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    el.disabled = false;
+  }
+}
+
 async function toggleAccount(cb, key) {
   const msg = document.getElementById('listMsg');
   cb.disabled = true;
@@ -505,6 +549,7 @@ async function checkKeys(key) {
 loadKeys();
 loadTools();
 loadLastImage();
+loadMCP();
 loadRecentOnce();
 setInterval(loadKeys, 3000);
 setInterval(tickCountdowns, 1000);

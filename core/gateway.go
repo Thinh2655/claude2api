@@ -116,14 +116,14 @@ func pickSession() config.SessionInfo {
 // lives in req.Client), and Cloudflare rejects claude.ai requests that have
 // the TLS signature without matching browser headers, so we apply them here.
 var chromeCommonHeaders = map[string]string{
-	"pragma":                    "no-cache",
-	"cache-control":             "no-cache",
-	"sec-ch-ua":                 `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`,
-	"sec-ch-ua-mobile":          "?0",
-	"sec-ch-ua-platform":        `"Windows"`,
-	"user-agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	"accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-	"accept-language":           "en-US,en;q=0.9",
+	"pragma":             "no-cache",
+	"cache-control":      "no-cache",
+	"sec-ch-ua":          `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`,
+	"sec-ch-ua-mobile":   "?0",
+	"sec-ch-ua-platform": `"Windows"`,
+	"user-agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"accept":             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+	"accept-language":    "en-US,en;q=0.9",
 }
 
 // gatewayRewriteRequest strips hop-by-hop/browser headers, injects browser

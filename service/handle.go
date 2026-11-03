@@ -457,6 +457,8 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	}
 
 	claudeClient.SetOrgID(session.OrgID)
+	// Attach account-configured MCP tools if EnableMCP is turned on
+	claudeClient.AttachMCPTools()
 
 	// Upload images if any
 	if len(processor.ImgDataList) > 0 {

@@ -75,18 +75,18 @@ func (p *ChatRequestProcessor) ProcessMessages(messages []map[string]interface{}
 							if text, ok := itemMap["text"].(string); ok {
 								p.Prompt.WriteString(text + "\n\n")
 							}
-					} else if itemType == "image_url" {
-						// Tùy chọn "chỉ nhận ảnh ở message cuối": bỏ qua ảnh ở
-						// các message cũ để khỏi upload lại mỗi request.
-						if onlyLastImage && mi != len(messages)-1 {
-							continue
-						}
-						if imageUrl, ok := itemMap["image_url"].(map[string]interface{}); ok {
-							if url, ok := imageUrl["url"].(string); ok {
-								p.ImgDataList = append(p.ImgDataList, url)
+						} else if itemType == "image_url" {
+							// Tùy chọn "chỉ nhận ảnh ở message cuối": bỏ qua ảnh ở
+							// các message cũ để khỏi upload lại mỗi request.
+							if onlyLastImage && mi != len(messages)-1 {
+								continue
+							}
+							if imageUrl, ok := itemMap["image_url"].(map[string]interface{}); ok {
+								if url, ok := imageUrl["url"].(string); ok {
+									p.ImgDataList = append(p.ImgDataList, url)
+								}
 							}
 						}
-					}
 					}
 				}
 			}

@@ -2,12 +2,12 @@ package core
 
 import (
 	"bufio"
-	cryptorand "crypto/rand"
-	"crypto/sha256"
 	"claude2api/config"
 	"claude2api/logger"
 	"claude2api/model"
 	"claude2api/utils"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -259,14 +259,14 @@ var modelThinkingSpecs = []struct {
 // BootstrapModel is one entry of claude_ai_bootstrap_models_config on
 // /api/bootstrap — the model list the web UI actually offers this account.
 type BootstrapModel struct {
-	Model       string                   `json:"model"`
-	Name        string                   `json:"name"`
-	Description string                   `json:"description"`
-	Inactive    bool                     `json:"inactive"`
-	Overflow    bool                     `json:"overflow"`
-	PaprikaModes []string                `json:"paprika_modes"`
+	Model         string                   `json:"model"`
+	Name          string                   `json:"name"`
+	Description   string                   `json:"description"`
+	Inactive      bool                     `json:"inactive"`
+	Overflow      bool                     `json:"overflow"`
+	PaprikaModes  []string                 `json:"paprika_modes"`
 	ThinkingModes []map[string]interface{} `json:"thinking_modes"`
-	HardLimit   int                      `json:"hard_limit"`
+	HardLimit     int                      `json:"hard_limit"`
 }
 
 // bootstrapModelsConfig holds the model list advertised by claude.ai, refreshed
@@ -516,18 +516,18 @@ func NewClientWithCookie(sessionKey string, proxy string, model string, cookie s
 	// same-origin POSTs, so we must override those fields to match - otherwise
 	// Cloudflare flags the request as bot traffic.
 	headers := map[string]string{
-		"accept":                         "text/event-stream, text/event-stream",
-		"accept-language":                "en-US,en;q=0.9",
-		"anthropic-client-platform":      "web_claude_ai",
-		"content-type":                   "application/json",
-		"origin":                         "https://claude.ai",
-		"priority":                       "u=1, i",
-		"sec-ch-ua-platform":             `"Windows"`,
-		"sec-fetch-site":                 "same-origin",
-		"sec-fetch-mode":                 "cors",
-		"sec-fetch-dest":                 "empty",
-		"sec-fetch-user":                 "?0",
-		"user-agent":                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"accept":                    "text/event-stream, text/event-stream",
+		"accept-language":           "en-US,en;q=0.9",
+		"anthropic-client-platform": "web_claude_ai",
+		"content-type":              "application/json",
+		"origin":                    "https://claude.ai",
+		"priority":                  "u=1, i",
+		"sec-ch-ua-platform":        `"Windows"`,
+		"sec-fetch-site":            "same-origin",
+		"sec-fetch-mode":            "cors",
+		"sec-fetch-dest":            "empty",
+		"sec-fetch-user":            "?0",
+		"user-agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	}
 	for key, value := range headers {
 		client.SetCommonHeader(key, value)
@@ -1371,14 +1371,14 @@ func IsUsageLimitMessage(s string) bool {
 }
 
 var (
-	limitInRe      = regexp.MustCompile(`(?i)resets?\s+(?:in\s+)?(\d+)\s*(second|minute|hour|day|week)s?`)
-	limitAtRe      = regexp.MustCompile(`(?i)(?:will\s+)?resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([^)]+)\))?`)
-	limitAt24Re    = regexp.MustCompile(`(?i)(?:will\s+)?resets?\s+(?:at\s+)?(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:\(([^)]+)\)|UTC|GMT)?`)
-	limitWeekRe    = regexp.MustCompile(`(?i)resets?\s+(?:at\s+)?(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([^)]+)\))?`)
-	limitDateRe    = regexp.MustCompile(`(?i)regain access on\s+(\d{4})-(\d{2})-(\d{2})\s+at\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(UTC|GMT)?`)
-	limitEpochRe   = regexp.MustCompile(`(?i)"?(resets_at|reset_at|resetsAt|resetAt|retry_after|retryAfter)"?\s*[:=]\s*"?(\d{10,13})"?`)
-	limitRetryRe   = regexp.MustCompile(`(?i)retry-after:\s*(\d+)`)
-	weekdayIndex   = map[string]time.Weekday{
+	limitInRe    = regexp.MustCompile(`(?i)resets?\s+(?:in\s+)?(\d+)\s*(second|minute|hour|day|week)s?`)
+	limitAtRe    = regexp.MustCompile(`(?i)(?:will\s+)?resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([^)]+)\))?`)
+	limitAt24Re  = regexp.MustCompile(`(?i)(?:will\s+)?resets?\s+(?:at\s+)?(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:\(([^)]+)\)|UTC|GMT)?`)
+	limitWeekRe  = regexp.MustCompile(`(?i)resets?\s+(?:at\s+)?(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([^)]+)\))?`)
+	limitDateRe  = regexp.MustCompile(`(?i)regain access on\s+(\d{4})-(\d{2})-(\d{2})\s+at\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(UTC|GMT)?`)
+	limitEpochRe = regexp.MustCompile(`(?i)"?(resets_at|reset_at|resetsAt|resetAt|retry_after|retryAfter)"?\s*[:=]\s*"?(\d{10,13})"?`)
+	limitRetryRe = regexp.MustCompile(`(?i)retry-after:\s*(\d+)`)
+	weekdayIndex = map[string]time.Weekday{
 		"mon": time.Monday, "tue": time.Tuesday, "wed": time.Wednesday,
 		"thu": time.Thursday, "fri": time.Friday, "sat": time.Saturday, "sun": time.Sunday,
 	}
