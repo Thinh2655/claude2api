@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 )
@@ -254,6 +256,74 @@ func MCPSetHandler(c *gin.Context) {
 		logger.Error(fmt.Sprintf("Failed to persist ENABLE_MCP to .env: %v", err))
 	}
 	c.JSON(http.StatusOK, gin.H{"enableMCP": body.Enabled})
+}
+
+// MCPSyncHandler synchronizes all accounts with a new remote MCP server URL.
+func MCPSyncHandler(c *gin.Context) {
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Dữ liệu JSON không hợp lệ"})
+		return
+	}
+	mcpURL := strings.TrimSpace(body.URL)
+	parsedURL, err := url.ParseRequestURI(mcpURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "URL MCP không hợp lệ (phải bắt đầu bằng http:// hoặc https://)"})
+		return
+	}
+
+	config.ConfigInstance.RwMutx.RLock()
+	sessionsCopy := make([]config.SessionInfo, len(config.ConfigInstance.Sessions))
+	copy(sessionsCopy, config.ConfigInstance.Sessions)
+	config.ConfigInstance.RwMutx.RUnlock()
+
+	if len(sessionsCopy) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Không có tài khoản nào trong pool",
+			"results": []core.SyncMCPResult{},
+		})
+		return
+	}
+
+	results := make([]core.SyncMCPResult, len(sessionsCopy))
+	var wg sync.WaitGroup
+	// Limit concurrency to 3 to avoid hitting Claude rate limits or TLS connection surges
+	sem := make(chan struct{}, 3)
+
+	for i, s := range sessionsCopy {
+		wg.Add(1)
+		go func(idx int, sess config.SessionInfo) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			label := displayLabel(&sess)
+			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
+			res, syncErr := client.SyncRemoteMCP(mcpURL)
+			if syncErr != nil {
+				results[idx] = core.SyncMCPResult{
+					Account: label,
+					Status:  "error",
+					Message: syncErr.Error(),
+				}
+				logger.Warn(fmt.Sprintf("MCP sync failed for account %s: %v", label, syncErr))
+			} else {
+				res.Account = label
+				results[idx] = *res
+				logger.Info(fmt.Sprintf("MCP sync succeeded for account %s: %s", label, res.Message))
+			}
+		}(i, s)
+	}
+
+	wg.Wait()
+	core.ClearMCPCache()
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Đã hoàn thành đồng bộ MCP",
+		"results": results,
+	})
 }
 
 // LastImageGetHandler returns whether only the last message's images are used

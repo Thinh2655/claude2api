@@ -153,6 +153,15 @@ const keysPageHTML = `<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>Đồng bộ MCP</h2>
+    <input type="text" id="mcpSyncUrl" placeholder="https://tool.kalei.site/mcp" autocomplete="off" value="https://tool.kalei.site/mcp">
+    <button class="btn-primary" id="mcpSyncBtn" onclick="syncMCP()">Đồng bộ tất cả tài khoản</button>
+    <div class="msg" id="mcpSyncMsg"></div>
+    <div class="hint">Xóa tất cả remote MCP custom cũ của từng tài khoản trong pool và thêm MCP mới với URL trên (chế độ no auth, các tool luôn được bật Always Allow).</div>
+    <div id="mcpSyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
+  </div>
+
+  <div class="card">
     <h2>Thêm tài khoản (dán cookie)</h2>
     <textarea id="newCookie" placeholder='Dán JSON mảng cookie (EditThisCookie/Cookie-Editor export) tại đây' autocomplete="off"></textarea>
     <button class="btn-primary" onclick="addAccount()">Thêm vào pool</button>
@@ -381,6 +390,77 @@ async function saveMCP(el) {
     msg.className = 'msg error';
   } finally {
     el.disabled = false;
+  }
+}
+
+async function syncMCP() {
+  const urlInput = document.getElementById('mcpSyncUrl');
+  const url = (urlInput.value || '').trim();
+  const msg = document.getElementById('mcpSyncMsg');
+  const resDiv = document.getElementById('mcpSyncResults');
+  const btn = document.getElementById('mcpSyncBtn');
+
+  if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
+    msg.textContent = 'Vui lòng nhập URL MCP hợp lệ (bắt đầu bằng http:// hoặc https://)';
+    msg.className = 'msg error';
+    return;
+  }
+
+  if (!confirm('Bạn có chắc muốn xóa tất cả MCP cũ và đồng bộ MCP mới (' + url + ') cho TOÀN BỘ tài khoản trong pool không?')) {
+    return;
+  }
+
+  btn.disabled = true;
+  btn.style.opacity = '.5';
+  msg.textContent = 'Đang đồng bộ MCP cho các tài khoản... Vui lòng đợi trong giây lát.';
+  msg.className = 'msg';
+  resDiv.innerHTML = '';
+
+  try {
+    const res = await fetch('/keys/api/mcp/sync', {
+      method: 'POST', headers,
+      body: JSON.stringify({ url: url })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msg.textContent = data.message || data.error || 'Đồng bộ thất bại';
+      msg.className = 'msg error';
+      return;
+    }
+    msg.textContent = data.message || 'Đồng bộ hoàn tất';
+    msg.className = 'msg success';
+
+    if (data.results && data.results.length) {
+      let html = '<div style="background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:.75rem; margin-top:.5rem;">';
+      html += '<div style="font-weight:600; margin-bottom:.4rem; color:var(--text);">Chi tiết từng tài khoản:</div>';
+      for (let i = 0; i < data.results.length; i++) {
+        const r = data.results[i];
+        let color = 'var(--err)';
+        let tag = 'LỖI';
+        let badgeClass = 'limited';
+        if (r.status === 'ok') {
+          color = 'var(--ok)';
+          tag = 'THÀNH CÔNG';
+          badgeClass = 'ok';
+        } else if (r.status === 'warning') {
+          color = 'var(--warn)';
+          tag = 'CẢNH BÁO';
+          badgeClass = 'limited';
+        }
+        html += '<div style="display:flex; justify-content:space-between; align-items:center; padding:.3rem 0; border-bottom:1px solid rgba(255,255,255,.05);">';
+        html += '<div><code>' + escapeHtml(r.account) + '</code> <span style="color:var(--muted); font-size:.8rem; margin-left:.5rem;">' + escapeHtml(r.message) + '</span></div>';
+        html += '<span class="badge ' + badgeClass + '" style="color:' + color + ';">' + tag + '</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+      resDiv.innerHTML = html;
+    }
+  } catch (e) {
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    btn.disabled = false;
+    btn.style.opacity = '';
   }
 }
 
