@@ -41,6 +41,7 @@ type ResponseEvent struct {
 	Index        int    `json:"index"`
 	ContentBlock struct {
 		Type string `json:"type"`
+		Name string `json:"name"`
 	} `json:"content_block"`
 	Delta struct {
 		Type     string `json:"type"`
@@ -94,6 +95,23 @@ func formatToolThinkingLog(input toolUseInput) string {
 		return ""
 	}
 	return strings.Join(parts, " | ")
+}
+
+// Tools whose file/code payload shouldn't be streamed into response text content
+// when executed via tools/MCP.
+var silentCodeTools = map[string]bool{
+	"write_file": true,
+}
+
+func isSilentCodeTool(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if i := strings.LastIndex(n, "__"); i >= 0 {
+		n = n[i+2:]
+	}
+	if i := strings.LastIndex(n, ":"); i >= 0 {
+		n = n[i+1:]
+	}
+	return silentCodeTools[n]
 }
 
 func detectToolLanguage(input toolUseInput) string {
@@ -895,6 +913,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	// pendingJSON accumulates a tool_use input_json_delta object until it parses
 	// as a complete JSON object, so we can extract the code field intact.
 	pendingJSON := ""
+	skipToolCode := false
 	toolLogEmitted := false
 	// Diagnostic: count the upstream event types, so a 200 with no usable
 	// content (dashboard shows Out ↓ = 0) can be traced to an unhandled delta
@@ -939,12 +958,18 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				// Nothing streamed yet - propagate so the caller can retry
 				return errors.New(event.Error.Message)
 			}
+			if event.Type == "content_block_start" {
+				pendingJSON = ""
+				toolLogEmitted = false
+				skipToolCode = event.ContentBlock.Type == "tool_use" && isSilentCodeTool(event.ContentBlock.Name)
+				continue
+			}
 			if event.Type == "content_block_stop" {
 				toolLogEmitted = false
 				// Flush any tool_use input still pending at block end. By now
 				// the object should parse; if it does and carries a code field,
 				// stream that. Otherwise drop the metadata.
-				if pendingJSON != "" {
+				if pendingJSON != "" && !skipToolCode {
 					var input toolUseInput
 					if err := json.Unmarshal([]byte(pendingJSON), &input); err == nil {
 						code := input.FileText
@@ -967,9 +992,10 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 							}
 						}
 					}
-					pendingJSON = ""
-					languageStr = "md"
 				}
+				pendingJSON = ""
+				languageStr = "md"
+				skipToolCode = false
 				if partial_json_shown {
 					closeCode := "\n```\n"
 					partial_json_shown = false
@@ -1039,6 +1065,10 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 						}
 						toolLogEmitted = true
 					}
+				}
+				if skipToolCode {
+					pendingJSON = ""
+					continue
 				}
 				// Pick the code field present in this tool input.
 				code := input.FileText

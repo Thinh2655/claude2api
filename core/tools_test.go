@@ -70,3 +70,36 @@ func TestFormatToolThinkingLog(t *testing.T) {
 		}
 	}
 }
+
+func TestIsSilentCodeTool(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"write_file", true},
+		{"mcp__tool__write_file", true},
+		{"tool:write_file", true},
+		{"tool:mcp__write_file", true},
+		{"WRITE_FILE", true},
+		{"  write_file  ", true},
+		{"\twrite_file\n", true},
+
+		{"read_file", false},
+		{"mcp__tool__read_file", false},
+		{"artifacts", false},
+		{"create_file", false},
+		{"", false},
+		{"mcp__tool__", false},
+		{"tool:", false},
+		{"write_file__", false},
+		{"write_file:", false},
+		{"mcp__tool__write_file:", false},
+		{"my_write_file", false},
+		{"write_file_v2", false},
+	}
+	for _, c := range cases {
+		if got := isSilentCodeTool(c.in); got != c.want {
+			t.Fatalf("isSilentCodeTool(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
