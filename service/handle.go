@@ -6,6 +6,7 @@ import (
 	"claude2api/logger"
 	"claude2api/model"
 	"claude2api/utils"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -158,6 +159,11 @@ func ChatCompletionsHandler(c *gin.Context) {
 			}
 			until := config.LockLimitSession(session.SessionKey, reason, ttl)
 			logger.Info(fmt.Sprintf("Account %s hit usage limit, locked until %s (%s)", label, until.Format("15:04:05"), reason))
+		} else if st == http.StatusBadGateway && strings.Contains(errMsg, "MCP tool requires manual approval") {
+			// Do not lock or cooldown account for MCP approval wait; stop retry loop and fail immediately
+			logger.Warn("Request stopped: MCP tool requires approval on claude.ai")
+			c.JSON(http.StatusBadGateway, ErrorResponse{Error: errMsg})
+			return
 		} else {
 			// Park the failing account so later requests skip it for a while
 			// instead of wasting time on a session that just rate-limited.
@@ -483,6 +489,9 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	conversationID, statusCode, err := claudeClient.SendMessageWithCreate(processor.Prompt.String(), stream, c)
 	if err != nil {
 		logger.Error(fmt.Sprintf("Failed to send message: %v", err))
+		if errors.Is(err, core.ErrMCPApproval) {
+			return fail(http.StatusBadGateway, "MCP tool requires manual approval on claude.ai UI. Please connect the tool in claude.ai or disable EnableMCP.")
+		}
 		return fail(statusCode, err.Error())
 	}
 	if statusCode != http.StatusOK {

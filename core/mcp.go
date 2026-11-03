@@ -243,12 +243,20 @@ type SyncMCPResult struct {
 	ToolCount int    `json:"toolCount"`
 }
 
-// SyncRemoteMCP replaces existing custom remote MCP servers on the account with the new MCP URL,
+// SyncRemoteMCP replaces existing custom remote MCP servers on the account with the new MCP URL and name,
 // then marks all its tools as always allowed (enabled_mcp_tools).
-func (c *Client) SyncRemoteMCP(mcpURL string) (*SyncMCPResult, error) {
+func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 	orgID, err := c.GetOrgID()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get organization: %w", err)
+	}
+
+	mcpName = strings.TrimSpace(mcpName)
+	if mcpName == "" {
+		mcpName = "mcp"
+	}
+	if len(mcpName) > 64 {
+		mcpName = mcpName[:64]
 	}
 
 	// 1. Fetch current remote servers to know what to delete
@@ -283,6 +291,18 @@ func (c *Client) SyncRemoteMCP(mcpURL string) (*SyncMCPResult, error) {
 			newServer = s
 			reused = true
 			logger.Info(fmt.Sprintf("Found existing connector %s matching URL %s", s.UUID, mcpURL))
+			// If existing connector has different name, update name via PUT
+			if s.Name != mcpName {
+				putURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers/%s", orgID, s.UUID)
+				putBody := map[string]interface{}{"name": mcpName}
+				c.client.R().
+					SetHeader("accept", "application/json").
+					SetHeader("content-type", "application/json").
+					SetHeader("referer", "https://claude.ai/chat").
+					SetBody(putBody).
+					Put(putURL)
+				newServer.Name = mcpName
+			}
 			break
 		}
 	}
@@ -290,7 +310,7 @@ func (c *Client) SyncRemoteMCP(mcpURL string) (*SyncMCPResult, error) {
 	// 2. If not found in existing list, create the new remote server
 	if !reused {
 		createBody := map[string]interface{}{
-			"name":          "mcp",
+			"name":          mcpName,
 			"url":           mcpURL,
 			"id_jag_config": nil,
 			"attestations":  []interface{}{},
@@ -314,8 +334,18 @@ func (c *Client) SyncRemoteMCP(mcpURL string) (*SyncMCPResult, error) {
 			errMsg, existingUUID := parseUpstreamError(createResp.Bytes())
 			if existingUUID != "" {
 				newServer.UUID = existingUUID
+				newServer.Name = mcpName
 				reused = true
 				logger.Info(fmt.Sprintf("409 Conflict: reusing existing connector UUID %s for URL %s", existingUUID, mcpURL))
+				// Try updating name
+				putURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers/%s", orgID, existingUUID)
+				putBody := map[string]interface{}{"name": mcpName}
+				c.client.R().
+					SetHeader("accept", "application/json").
+					SetHeader("content-type", "application/json").
+					SetHeader("referer", "https://claude.ai/chat").
+					SetBody(putBody).
+					Put(putURL)
 			} else {
 				return nil, fmt.Errorf("URL MCP này đã tồn tại trên tài khoản (409 Conflict: %s). Vui lòng kiểm tra lại Connectors trên claude.ai", errMsg)
 			}

@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,12 +37,17 @@ type Client struct {
 	defaultAttrs map[string]interface{}
 }
 
+// ErrMCPApproval is returned when an MCP tool call pauses upstream waiting for manual approval.
+var ErrMCPApproval = errors.New("MCP tool requires manual approval on claude.ai")
+
 type ResponseEvent struct {
 	Type         string `json:"type"`
 	Index        int    `json:"index"`
 	ContentBlock struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type            string   `json:"type"`
+		Name            string   `json:"name"`
+		ApprovalOptions []string `json:"approval_options"`
+		ApprovalKey     string   `json:"approval_key"`
 	} `json:"content_block"`
 	Delta struct {
 		Type     string `json:"type"`
@@ -785,13 +791,16 @@ func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Cont
 	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/completion",
 		c.orgID, conversationID)
 
-	resp, err := c.client.R().DisableAutoReadResponse().
+	reqBuilder := c.client.R().DisableAutoReadResponse().
 		SetHeader("referer", "https://claude.ai/new").
 		SetHeader("accept", "text/event-stream, text/event-stream").
 		SetHeader("anthropic-client-platform", "web_claude_ai").
 		SetHeader("cache-control", "no-cache").
-		SetBody(requestBody).
-		Post(url)
+		SetBody(requestBody)
+	if gc != nil && gc.Request != nil {
+		reqBuilder.SetContext(gc.Request.Context())
+	}
+	resp, err := reqBuilder.Post(url)
 	if err != nil {
 		return "", 500, fmt.Errorf("request failed: %w", err)
 	}
@@ -851,13 +860,16 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 		"is_temporary":                     false,
 	}
 	// Set up streaming response
-	resp, err := c.client.R().DisableAutoReadResponse().
+	reqBuilder := c.client.R().DisableAutoReadResponse().
 		SetHeader("referer", fmt.Sprintf("https://claude.ai/chat/%s", conversationID)).
 		SetHeader("accept", "text/event-stream, text/event-stream").
 		SetHeader("anthropic-client-platform", "web_claude_ai").
 		SetHeader("cache-control", "no-cache").
-		SetBody(requestBody).
-		Post(url)
+		SetBody(requestBody)
+	if gc != nil && gc.Request != nil {
+		reqBuilder.SetContext(gc.Request.Context())
+	}
+	resp, err := reqBuilder.Post(url)
 	if err != nil {
 		return 500, fmt.Errorf("request failed: %w", err)
 	}
@@ -902,6 +914,26 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	// 64KB buffer aborts mid-stream with "token too long"
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 	clientDone := gc.Request.Context().Done()
+
+	var timedOut, approvalAbort atomic.Bool
+	const idleTimeout = 90 * time.Second
+	timer := time.AfterFunc(idleTimeout, func() {
+		timedOut.Store(true)
+		body.Close()
+	})
+	defer timer.Stop()
+
+	// Unblock scanner.Scan() immediately if client disconnects
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+	go func() {
+		select {
+		case <-clientDone:
+			body.Close()
+		case <-doneCh:
+		}
+	}()
+
 	// Keep track of the full response for the final message
 	res_all_text := ""
 	res_reasoning_text := ""
@@ -926,6 +958,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	defer func() {
 		gc.Set("CompletionTokens", utils.EstimateCompletionTokens(res_all_text+res_reasoning_text))
 	}()
+scan:
 	for scanner.Scan() {
 		select {
 		case <-clientDone:
@@ -948,6 +981,11 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				key += "/" + event.Delta.Type
 			}
 			seenTypes[key]++
+
+			if event.Type != "ping" {
+				timer.Reset(idleTimeout)
+			}
+
 			if event.Type == "error" && event.Error.Message != "" {
 				if res_all_text != "" {
 					// Content was already streamed to the client; append the
@@ -959,6 +997,14 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 				return errors.New(event.Error.Message)
 			}
 			if event.Type == "content_block_start" {
+				// Detect if an MCP tool call requires manual approval on claude.ai UI
+				// which causes upstream to pause and hang indefinitely.
+				if event.ContentBlock.Type == "tool_use" && len(event.ContentBlock.ApprovalOptions) > 0 {
+					logger.Warn(fmt.Sprintf("MCP tool %q requires manual approval on claude.ai, aborting to prevent hang", event.ContentBlock.Name))
+					approvalAbort.Store(true)
+					body.Close()
+					break scan
+				}
 				pendingJSON = ""
 				toolLogEmitted = false
 				skipToolCode = event.ContentBlock.Type == "tool_use" && isSilentCodeTool(event.ContentBlock.Name)
@@ -1100,8 +1146,27 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
+	aborted := approvalAbort.Load() || timedOut.Load()
+	if err := scanner.Err(); err != nil && !aborted {
 		return fmt.Errorf("error reading response: %w", err)
+	}
+
+	if aborted {
+		if timedOut.Load() {
+			logger.Warn("Upstream SSE stream timed out (no data for 90s)")
+		}
+		if res_all_text == "" && res_reasoning_text == "" {
+			if approvalAbort.Load() {
+				return ErrMCPApproval
+			}
+			return errors.New("upstream response timed out")
+		}
+		// Content was already partially streamed: append note and finish cleanly
+		msg := "\n\n[Response ended: MCP tool requires approval or stream timed out]"
+		res_all_text += msg
+		if stream {
+			model.ReturnOpenAIResponse(msg, stream, gc)
+		}
 	}
 	// Nothing parsed out of the stream: log the event types seen so an empty
 	// response (Out ↓ = 0) can be diagnosed without re-enabling the SSE dump.

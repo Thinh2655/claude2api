@@ -154,10 +154,13 @@ const keysPageHTML = `<!DOCTYPE html>
 
   <div class="card">
     <h2>Đồng bộ MCP</h2>
-    <input type="text" id="mcpSyncUrl" placeholder="https://tool.kalei.site/mcp" autocomplete="off" value="https://tool.kalei.site/mcp">
+    <div style="display:flex; gap:.75rem; margin-bottom:.75rem;">
+      <input type="text" id="mcpSyncName" placeholder="Tên MCP (vd: tool)" autocomplete="off" value="tool" style="width:160px; margin-bottom:0;">
+      <input type="text" id="mcpSyncUrl" placeholder="URL MCP (vd: https://tool.kalei.site/mcp)" autocomplete="off" value="https://tool.kalei.site/mcp" style="flex:1; margin-bottom:0;">
+    </div>
     <button class="btn-primary" id="mcpSyncBtn" onclick="syncMCP()">Đồng bộ tất cả tài khoản</button>
     <div class="msg" id="mcpSyncMsg"></div>
-    <div class="hint">Xóa tất cả remote MCP custom cũ của từng tài khoản trong pool và thêm MCP mới với URL trên (chế độ no auth, các tool luôn được bật Always Allow).</div>
+    <div class="hint">Xóa tất cả remote MCP custom cũ của từng tài khoản trong pool và thêm MCP mới với tên và URL trên (chế độ no auth, các tool luôn được bật Always Allow).</div>
     <div id="mcpSyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
   </div>
 
@@ -394,7 +397,9 @@ async function saveMCP(el) {
 }
 
 async function syncMCP() {
+  const nameInput = document.getElementById('mcpSyncName');
   const urlInput = document.getElementById('mcpSyncUrl');
+  const name = (nameInput.value || '').trim() || 'tool';
   const url = (urlInput.value || '').trim();
   const msg = document.getElementById('mcpSyncMsg');
   const resDiv = document.getElementById('mcpSyncResults');
@@ -406,7 +411,7 @@ async function syncMCP() {
     return;
   }
 
-  if (!confirm('Bạn có chắc muốn xóa tất cả MCP cũ và đồng bộ MCP mới (' + url + ') cho TOÀN BỘ tài khoản trong pool không?')) {
+  if (!confirm('Bạn có chắc muốn xóa tất cả MCP cũ và đồng bộ MCP mới (Tên: ' + name + ', URL: ' + url + ') cho TOÀN BỘ tài khoản trong pool không?')) {
     return;
   }
 
@@ -419,7 +424,7 @@ async function syncMCP() {
   try {
     const res = await fetch('/keys/api/mcp/sync', {
       method: 'POST', headers,
-      body: JSON.stringify({ url: url })
+      body: JSON.stringify({ name: name, url: url })
     });
     const data = await res.json();
     if (!res.ok) {

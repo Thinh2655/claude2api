@@ -261,13 +261,18 @@ func MCPSetHandler(c *gin.Context) {
 // MCPSyncHandler synchronizes all accounts with a new remote MCP server URL.
 func MCPSyncHandler(c *gin.Context) {
 	var body struct {
-		URL string `json:"url"`
+		Name string `json:"name"`
+		URL  string `json:"url"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Dữ liệu JSON không hợp lệ"})
 		return
 	}
 	mcpURL := strings.TrimSpace(body.URL)
+	mcpName := strings.TrimSpace(body.Name)
+	if mcpName == "" {
+		mcpName = "mcp"
+	}
 	parsedURL, err := url.ParseRequestURI(mcpURL)
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "URL MCP không hợp lệ (phải bắt đầu bằng http:// hoặc https://)"})
@@ -301,7 +306,7 @@ func MCPSyncHandler(c *gin.Context) {
 
 			label := displayLabel(&sess)
 			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
-			res, syncErr := client.SyncRemoteMCP(mcpURL)
+			res, syncErr := client.SyncRemoteMCP(mcpName, mcpURL)
 			if syncErr != nil {
 				results[idx] = core.SyncMCPResult{
 					Account: label,
