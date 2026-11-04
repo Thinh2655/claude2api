@@ -39,6 +39,10 @@ type keysResponse struct {
 	Keys []keyInfo `json:"keys"`
 }
 
+// mcpOpMu serializes MCP sync/delete so two dashboard actions cannot create
+// and delete connectors on the same accounts at once.
+var mcpOpMu sync.Mutex
+
 // maskKey hides the middle of a session key for display
 func maskKey(key string) string {
 	if len(key) <= 30 {
@@ -279,6 +283,12 @@ func MCPSyncHandler(c *gin.Context) {
 		return
 	}
 
+	if !mcpOpMu.TryLock() {
+		c.JSON(http.StatusConflict, ErrorResponse{Error: "Đang có thao tác MCP khác chạy, vui lòng thử lại sau"})
+		return
+	}
+	defer mcpOpMu.Unlock()
+
 	config.ConfigInstance.RwMutx.RLock()
 	sessionsCopy := make([]config.SessionInfo, len(config.ConfigInstance.Sessions))
 	copy(sessionsCopy, config.ConfigInstance.Sessions)
@@ -327,6 +337,88 @@ func MCPSyncHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Đã hoàn thành đồng bộ MCP",
+		"results": results,
+	})
+}
+
+// MCPDeleteHandler deletes every custom remote MCP server for all accounts in
+// the pool. Body: {"key": "<full session key>"} targets a single account;
+// an empty body deletes for every account.
+func MCPDeleteHandler(c *gin.Context) {
+	var body struct {
+		Key string `json:"key"`
+	}
+	_ = c.ShouldBindJSON(&body) // empty body = all accounts
+	key := strings.TrimSpace(body.Key)
+
+	config.ConfigInstance.RwMutx.RLock()
+	sessionsCopy := make([]config.SessionInfo, len(config.ConfigInstance.Sessions))
+	copy(sessionsCopy, config.ConfigInstance.Sessions)
+	config.ConfigInstance.RwMutx.RUnlock()
+
+	if key != "" {
+		filtered := make([]config.SessionInfo, 0, 1)
+		for _, s := range sessionsCopy {
+			if s.SessionKey == key {
+				filtered = append(filtered, s)
+			}
+		}
+		if len(filtered) == 0 {
+			c.JSON(http.StatusNotFound, ErrorResponse{Error: "Account not found"})
+			return
+		}
+		sessionsCopy = filtered
+	}
+
+	if len(sessionsCopy) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Không có tài khoản nào trong pool",
+			"results": []core.SyncMCPResult{},
+		})
+		return
+	}
+
+	if !mcpOpMu.TryLock() {
+		c.JSON(http.StatusConflict, ErrorResponse{Error: "Đang có thao tác MCP khác chạy, vui lòng thử lại sau"})
+		return
+	}
+	defer mcpOpMu.Unlock()
+
+	results := make([]core.SyncMCPResult, len(sessionsCopy))
+	var wg sync.WaitGroup
+	// Limit concurrency to 3 to avoid hitting Claude rate limits or TLS connection surges
+	sem := make(chan struct{}, 3)
+
+	for i, s := range sessionsCopy {
+		wg.Add(1)
+		go func(idx int, sess config.SessionInfo) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			label := displayLabel(&sess)
+			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
+			res, delErr := client.DeleteAllRemoteMCP()
+			if delErr != nil {
+				results[idx] = core.SyncMCPResult{
+					Account: label,
+					Status:  "error",
+					Message: delErr.Error(),
+				}
+				logger.Warn(fmt.Sprintf("MCP delete failed for account %s: %v", label, delErr))
+			} else {
+				res.Account = label
+				results[idx] = *res
+				logger.Info(fmt.Sprintf("MCP delete for account %s: %s", label, res.Message))
+			}
+		}(i, s)
+	}
+
+	wg.Wait()
+	core.ClearMCPCache()
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Đã hoàn thành xóa MCP custom",
 		"results": results,
 	})
 }

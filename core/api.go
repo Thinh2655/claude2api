@@ -6,6 +6,7 @@ import (
 	"claude2api/logger"
 	"claude2api/model"
 	"claude2api/utils"
+	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -916,6 +917,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	clientDone := gc.Request.Context().Done()
 
 	var timedOut, approvalAbort atomic.Bool
+	approvalTool := ""
 	const idleTimeout = 90 * time.Second
 	timer := time.AfterFunc(idleTimeout, func() {
 		timedOut.Store(true)
@@ -1000,7 +1002,8 @@ scan:
 				// Detect if an MCP tool call requires manual approval on claude.ai UI
 				// which causes upstream to pause and hang indefinitely.
 				if event.ContentBlock.Type == "tool_use" && len(event.ContentBlock.ApprovalOptions) > 0 {
-					logger.Warn(fmt.Sprintf("MCP tool %q requires manual approval on claude.ai, aborting to prevent hang", event.ContentBlock.Name))
+					approvalTool = event.ContentBlock.Name
+					logger.Warn(fmt.Sprintf("MCP tool %q requires manual approval on claude.ai, aborting to prevent hang", approvalTool))
 					approvalAbort.Store(true)
 					body.Close()
 					break scan
@@ -1151,21 +1154,35 @@ scan:
 		return fmt.Errorf("error reading response: %w", err)
 	}
 
+	filterFinished := false
 	if aborted {
 		if timedOut.Load() {
 			logger.Warn("Upstream SSE stream timed out (no data for 90s)")
 		}
 		if res_all_text == "" && res_reasoning_text == "" {
 			if approvalAbort.Load() {
+				if approvalTool != "" {
+					return fmt.Errorf("%w (tool %q)", ErrMCPApproval, approvalTool)
+				}
 				return ErrMCPApproval
 			}
 			return errors.New("upstream response timed out")
 		}
-		// Content was already partially streamed: append note and finish cleanly
-		msg := "\n\n[Response ended: MCP tool requires approval or stream timed out]"
-		res_all_text += msg
+		// Content was already partially streamed: flush held-back text before
+		// appending the error note so the note always comes last, then finish.
+		note := "\n\n[Response ended: upstream stream timed out]"
+		if approvalAbort.Load() {
+			if approvalTool != "" {
+				note = fmt.Sprintf("\n\n[claude2api error] MCP tool %q requires approval on claude.ai. Enable \"Always allow\" for this tool and retry.", approvalTool)
+			} else {
+				note = "\n\n[claude2api error] An MCP tool requires approval on claude.ai. Enable \"Always allow\" for it and retry."
+			}
+		}
+		res_all_text += note
 		if stream {
-			model.ReturnOpenAIResponse(msg, stream, gc)
+			toolFilter.Finish(gc)
+			filterFinished = true
+			model.ReturnOpenAIResponse(note, stream, gc)
 		}
 	}
 	// Nothing parsed out of the stream: log the event types seen so an empty
@@ -1177,7 +1194,9 @@ scan:
 		model.ResponseWithTools(res_all_text, res_reasoning_text, stream, gc)
 	} else {
 		// Flush any held-back text/toolcall block, then the end marker.
-		toolFilter.Finish(gc)
+		if !filterFinished {
+			toolFilter.Finish(gc)
+		}
 		gc.Writer.Write([]byte("data: [DONE]\n\n"))
 		gc.Writer.Flush()
 	}
@@ -1318,76 +1337,81 @@ func (c *Client) SetBigContext(context string) {
 
 }
 
-// / UpdateUserSetting updates a single user setting on Claude.ai while preserving all other settings
+var allowedUserSettings = map[string]bool{
+	"input_menu_pinned_items":          true,
+	"has_seen_mm_examples":             true,
+	"has_seen_starter_prompts":         true,
+	"has_started_claudeai_onboarding":  true,
+	"has_finished_claudeai_onboarding": true,
+	"dismissed_claudeai_banners":       true,
+	"dismissed_artifacts_announcement": true,
+	"preview_feature_uses_artifacts":   true,
+	"preview_feature_uses_latex":       true,
+	"preview_feature_uses_citations":   true,
+	"preview_feature_uses_harmony":     true,
+	"enabled_artifacts_attachments":    true,
+	"enabled_turmeric":                 true,
+	"enable_chat_suggestions":          true,
+	"dismissed_artifact_feedback_form": true,
+	"enabled_mm_pdfs":                  true,
+	"enabled_gdrive":                   true,
+	"enabled_bananagrams":              true,
+	"enabled_gdrive_indexing":          true,
+	"enabled_web_search":               true,
+	"enabled_compass":                  true,
+	"enabled_sourdough":                true,
+	"enabled_foccacia":                 true,
+	"dismissed_claude_code_spotlight":  true,
+	"enabled_geolocation":              true,
+	"enabled_mcp_tools":                true,
+	"paprika_mode":                     true,
+	"enabled_monkeys_in_a_barrel":      true,
+}
+
+// UpdateUserSetting updates one account setting. claude.ai's web UI uses
+// PATCH /api/account/settings with the settings object as the direct body;
+// PUT /api/account silently drops always-approved MCP keys. The PATCH merges
+// the map, so a nil value is required to remove an existing key.
 func (c *Client) UpdateUserSetting(key string, value interface{}) error {
-	url := "https://claude.ai/api/account?statsig_hashing_algorithm=djb2"
-
-	// Default settings structure with all possible fields
-	settings := map[string]interface{}{
-		"input_menu_pinned_items":          nil,
-		"has_seen_mm_examples":             nil,
-		"has_seen_starter_prompts":         nil,
-		"has_started_claudeai_onboarding":  true,
-		"has_finished_claudeai_onboarding": true,
-		"dismissed_claudeai_banners":       []interface{}{},
-		"dismissed_artifacts_announcement": nil,
-		"preview_feature_uses_artifacts":   nil,
-		"preview_feature_uses_latex":       nil,
-		"preview_feature_uses_citations":   nil,
-		"preview_feature_uses_harmony":     nil,
-		"enabled_artifacts_attachments":    true,
-		"enabled_turmeric":                 nil,
-		"enable_chat_suggestions":          nil,
-		"dismissed_artifact_feedback_form": nil,
-		"enabled_mm_pdfs":                  nil,
-		"enabled_gdrive":                   nil,
-		"enabled_bananagrams":              nil,
-		"enabled_gdrive_indexing":          nil,
-		"enabled_web_search":               true,
-		"enabled_compass":                  nil,
-		"enabled_sourdough":                nil,
-		"enabled_foccacia":                 nil,
-		"dismissed_claude_code_spotlight":  nil,
-		"enabled_geolocation":              nil,
-		"enabled_mcp_tools":                nil,
-		"paprika_mode":                     nil,
-		"enabled_monkeys_in_a_barrel":      nil,
-	}
-
-	// Update the specified setting
-	if _, exists := settings[key]; exists {
-		settings[key] = value
-		logger.Info(fmt.Sprintf("Updating setting %s to %v", key, value))
-	} else {
+	if !allowedUserSettings[key] {
 		return fmt.Errorf("unknown setting key: %s", key)
 	}
-
-	// Create request body
-	requestBody := map[string]interface{}{
-		"settings": settings,
+	if m, ok := value.(map[string]interface{}); ok {
+		logger.Info(fmt.Sprintf("Updating setting %s (%d entries)", key, len(m)))
+	} else {
+		logger.Info(fmt.Sprintf("Updating setting %s to %v", key, value))
 	}
 
-	// Make the request
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
 	resp, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("accept", "application/json").
+		SetHeader("content-type", "application/json").
 		SetHeader("referer", "https://claude.ai/new").
 		SetHeader("origin", "https://claude.ai").
 		SetHeader("anthropic-client-platform", "web_claude_ai").
 		SetHeader("cache-control", "no-cache").
 		SetHeader("pragma", "no-cache").
 		SetHeader("priority", "u=1, i").
-		SetBody(requestBody).
-		Put(url)
+		SetBody(map[string]interface{}{key: value}).
+		Patch("https://claude.ai/api/account/settings")
 
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != 202 {
-		return fmt.Errorf("unexpected status code: %d, response: %s", resp.StatusCode, resp.String())
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+		return nil
 	}
 
-	// logger.Info(fmt.Sprintf("Successfully updated user setting %s: %s", key, resp.String()))
-	return nil
+	body := resp.String()
+	if len(body) > 300 {
+		body = body[:300] + "..."
+	}
+	return fmt.Errorf("unexpected status code: %d, response: %s", resp.StatusCode, body)
 }
 
 // readErrorSnippet reads up to 8KB of a failed upstream response for limit

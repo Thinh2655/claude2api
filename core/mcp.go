@@ -32,9 +32,11 @@ type remoteMCPServer struct {
 }
 
 type remoteMCPTool struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	InputSchema map[string]interface{} `json:"inputSchema"`
+	Name              string                 `json:"name"`
+	Description       string                 `json:"description"`
+	InputSchema       map[string]interface{} `json:"inputSchema"`
+	EnabledKey        string                 `json:"enabled_key"`
+	AlwaysApprovedKey string                 `json:"always_approved_key"`
 }
 
 type remoteMCPToolsResponse struct {
@@ -234,10 +236,10 @@ func parseUpstreamError(body []byte) (message, existingUUID string) {
 	return s, ""
 }
 
-// SyncMCPResult holds the outcome of synchronizing a remote MCP server for an account.
+// SyncMCPResult holds the outcome of an MCP sync/delete operation for an account.
 type SyncMCPResult struct {
 	Account   string `json:"account"`
-	Status    string `json:"status"` // "ok" or "error"
+	Status    string `json:"status"` // "ok", "warning" or "error"
 	Message   string `json:"message"`
 	Deleted   int    `json:"deleted"`
 	ToolCount int    `json:"toolCount"`
@@ -404,42 +406,82 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 		}
 	}
 
-	// 5. Update enabled_mcp_tools setting (Always Allow)
-	// Read current account settings to clean up old server keys and merge new ones
-	enabledMap := make(map[string]interface{})
-	accCtx, accCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	accResp, accErr := c.client.R().
-		SetContext(accCtx).
-		SetHeader("accept", "application/json").
-		Get("https://claude.ai/api/account")
-	accCancel()
-	if accErr == nil && accResp.StatusCode == http.StatusOK {
-		var accData map[string]interface{}
-		if json.Unmarshal(accResp.Bytes(), &accData) == nil {
-			if sett, ok := accData["settings"].(map[string]interface{}); ok {
-				if curTools, ok := sett["enabled_mcp_tools"].(map[string]interface{}); ok {
-					for k, v := range curTools {
-						// Drop keys belonging to deleted old servers
-						parts := strings.SplitN(k, ":", 2)
-						if len(parts) > 0 && oldUUIDs[parts[0]] {
-							continue
-						}
-						enabledMap[k] = v
-					}
-				}
+	// 5. Update enabled_mcp_tools setting (Always Allow).
+	// claude.ai stores two keys per tool: "<uuid>:<tool>" (tool enabled) and
+	// "<uuid>:<tool>-<hash>" (Always Allow). Both must be true so the upstream
+	// call does not pause for manual approval mid-stream.
+	enabledMap, settingsErr := c.fetchEnabledMCPTools()
+	if settingsErr != nil {
+		logger.Warn(fmt.Sprintf("Failed to read enabled_mcp_tools for org %s: %v", orgID, settingsErr))
+	} else {
+		// Drop keys of deleted servers and stale keys of the reused server:
+		// the always-allow hash can change when a tool definition changes.
+		// PATCH merges the map, so set removed keys to nil instead of omitting
+		// them; otherwise claude.ai keeps the old value.
+		for k := range enabledMap {
+			parts := strings.SplitN(k, ":", 2)
+			if len(parts) > 0 && (oldUUIDs[parts[0]] || parts[0] == newServer.UUID) {
+				enabledMap[k] = nil
 			}
 		}
 	}
 
-	for _, tool := range toolsResp.Tools {
-		if tool.Name != "" {
-			enabledMap[fmt.Sprintf("%s:%s", newServer.UUID, tool.Name)] = true
+	missingAlways := 0
+	alwaysKeys := make([]string, 0, len(toolsResp.Tools))
+	if settingsErr == nil {
+		for _, tool := range toolsResp.Tools {
+			if tool.Name == "" {
+				continue
+			}
+			enabledKey := tool.EnabledKey
+			if enabledKey == "" {
+				enabledKey = fmt.Sprintf("%s:%s", newServer.UUID, tool.Name)
+			}
+			enabledMap[enabledKey] = true
+			if tool.AlwaysApprovedKey == "" {
+				missingAlways++
+				continue
+			}
+			enabledMap[tool.AlwaysApprovedKey] = true
+			alwaysKeys = append(alwaysKeys, tool.AlwaysApprovedKey)
 		}
 	}
 
-	if len(enabledMap) > 0 {
+	settingErr := settingsErr
+	if settingErr == nil && len(toolsResp.Tools) > 0 {
 		if err := c.UpdateUserSetting("enabled_mcp_tools", enabledMap); err != nil {
+			settingErr = fmt.Errorf("write setting: %w", err)
 			logger.Warn(fmt.Sprintf("Failed to set always-allow for org %s: %v", orgID, err))
+		} else {
+			// PATCH returns 202 (accepted), so allow the read-back a moment to
+			// catch up before reporting a failure.
+			missingKey := ""
+			for attempt := 0; attempt < 3; attempt++ {
+				if attempt > 0 {
+					time.Sleep(500 * time.Millisecond)
+				}
+				saved, err := c.fetchEnabledMCPTools()
+				if err != nil {
+					settingErr = fmt.Errorf("verify setting: %w", err)
+					logger.Warn(fmt.Sprintf("Failed to verify always-allow for org %s: %v", orgID, err))
+					continue
+				}
+				settingErr = nil
+				missingKey = ""
+				for _, key := range alwaysKeys {
+					if v, ok := saved[key]; !ok || v != true {
+						missingKey = key
+						break
+					}
+				}
+				if missingKey == "" {
+					break
+				}
+			}
+			if settingErr == nil && missingKey != "" {
+				settingErr = fmt.Errorf("setting %q was not persisted", missingKey)
+				logger.Warn(fmt.Sprintf("Always Allow key %q missing after sync for org %s", missingKey, orgID))
+			}
 		}
 	}
 
@@ -450,9 +492,22 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 
 	status := "ok"
 	msg := fmt.Sprintf("Đã xóa %d server cũ, %s với %d tool (Always Allow)", deletedCount, actionDesc, len(toolsResp.Tools))
+	var warnings []string
 	if len(toolsResp.Tools) == 0 {
 		status = "warning"
 		msg = fmt.Sprintf("Đã xóa %d server cũ, %s nhưng chưa tải được danh sách tool", deletedCount, actionDesc)
+	}
+	if missingAlways > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d tool thiếu always_approved_key", missingAlways))
+	}
+	if settingErr != nil && len(toolsResp.Tools) > 0 {
+		warnings = append(warnings, "chưa bật được Always Allow")
+	}
+	if len(warnings) > 0 {
+		if status == "ok" {
+			status = "warning"
+		}
+		msg += " (" + strings.Join(warnings, "; ") + ")"
 	}
 
 	return &SyncMCPResult{
@@ -461,4 +516,189 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 		Deleted:   deletedCount,
 		ToolCount: len(toolsResp.Tools),
 	}, nil
+}
+
+// listRemoteServers returns the custom remote MCP servers configured on the
+// account's organization.
+func (c *Client) listRemoteServers(orgID string) ([]remoteMCPServer, error) {
+	serversURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers", orgID)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	resp, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("accept", "application/json").
+		SetHeader("referer", "https://claude.ai/chat").
+		Get(serversURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list remote MCP servers: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list remote MCP servers status: %d", resp.StatusCode)
+	}
+
+	var servers []remoteMCPServer
+	if err := json.Unmarshal(resp.Bytes(), &servers); err != nil {
+		return nil, fmt.Errorf("failed to parse remote MCP servers: %w", err)
+	}
+	return servers, nil
+}
+
+// deleteRemoteServer removes one remote MCP server. A 404 counts as success
+// because the server is already gone.
+func (c *Client) deleteRemoteServer(orgID, uuid string) error {
+	delURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers/%s", orgID, uuid)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("accept", "application/json").
+		SetHeader("referer", "https://claude.ai/chat").
+		Delete(delURL)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("delete status: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// fetchEnabledMCPTools reads the account's enabled_mcp_tools map.
+func (c *Client) fetchEnabledMCPTools() (map[string]interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("accept", "application/json").
+		Get("https://claude.ai/api/account")
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status: %d", resp.StatusCode)
+	}
+
+	var acc struct {
+		Settings struct {
+			EnabledMCPTools map[string]interface{} `json:"enabled_mcp_tools"`
+		} `json:"settings"`
+	}
+	if err := json.Unmarshal(resp.Bytes(), &acc); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+	if acc.Settings.EnabledMCPTools == nil {
+		acc.Settings.EnabledMCPTools = make(map[string]interface{})
+	}
+	return acc.Settings.EnabledMCPTools, nil
+}
+
+// pruneEnabledMCPTools drops always-allow entries that belong to deleted
+// servers. It only writes the setting when something actually changed, so
+// accounts without stale entries keep their other settings untouched.
+func (c *Client) pruneEnabledMCPTools(deleted map[string]bool) error {
+	enabled, err := c.fetchEnabledMCPTools()
+	if err != nil {
+		return fmt.Errorf("read account settings failed: %w", err)
+	}
+
+	kept := make(map[string]interface{}, len(enabled))
+	changed := false
+	for k, v := range enabled {
+		parts := strings.SplitN(k, ":", 2)
+		if len(parts) > 0 && deleted[parts[0]] {
+			changed = true
+			kept[k] = nil
+			continue
+		}
+		kept[k] = v
+	}
+	if !changed {
+		return nil
+	}
+	return c.UpdateUserSetting("enabled_mcp_tools", kept)
+}
+
+// DeleteAllRemoteMCP removes every custom remote MCP server from the account
+// and prunes its always-allow entries. The returned result is "ok", "warning"
+// (partial deletion / cleanup failure) or "error" (nothing could be deleted).
+func (c *Client) DeleteAllRemoteMCP() (*SyncMCPResult, error) {
+	orgID, err := c.GetOrgID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get organization: %w", err)
+	}
+
+	servers, err := c.listRemoteServers(orgID)
+	if err != nil {
+		return nil, err
+	}
+
+	total := 0
+	for _, s := range servers {
+		if s.UUID != "" {
+			total++
+		}
+	}
+	if total == 0 {
+		return &SyncMCPResult{Status: "ok", Message: "Không có MCP custom nào để xóa"}, nil
+	}
+
+	deleted := make(map[string]bool, total)
+	failed := 0
+	for _, s := range servers {
+		if s.UUID == "" {
+			continue
+		}
+		if err := c.deleteRemoteServer(orgID, s.UUID); err != nil {
+			failed++
+			logger.Warn(fmt.Sprintf("Failed to delete MCP server %s (%s): %v", s.Name, s.UUID, err))
+			continue
+		}
+		deleted[s.UUID] = true
+	}
+
+	settingWarn := false
+	if len(deleted) > 0 {
+		if err := c.pruneEnabledMCPTools(deleted); err != nil {
+			settingWarn = true
+			logger.Warn(fmt.Sprintf("Failed to prune enabled_mcp_tools for org %s: %v", orgID, err))
+		}
+	}
+
+	// Re-list to confirm nothing was left behind (catches pagination or a
+	// DELETE that returned success without actually removing the server).
+	remaining := 0
+	verified := true
+	if after, listErr := c.listRemoteServers(orgID); listErr != nil {
+		verified = false
+		logger.Warn(fmt.Sprintf("Failed to verify remaining MCP servers for org %s: %v", orgID, listErr))
+	} else {
+		for _, s := range after {
+			if s.UUID != "" {
+				remaining++
+			}
+		}
+	}
+
+	status := "ok"
+	msg := fmt.Sprintf("Đã xóa %d MCP custom", len(deleted))
+	if len(deleted) == 0 && failed > 0 {
+		status = "error"
+		msg = fmt.Sprintf("Không xóa được MCP custom nào (%d lỗi)", failed)
+	} else if failed > 0 || settingWarn || (verified && remaining > 0) {
+		status = "warning"
+		if failed > 0 {
+			msg += fmt.Sprintf(", %d lỗi khi xóa", failed)
+		}
+		if verified && remaining > 0 {
+			msg += fmt.Sprintf(", còn %d MCP chưa xóa được", remaining)
+		}
+		if settingWarn {
+			msg += "; chưa dọn được quyền Always Allow cũ"
+		}
+	}
+
+	return &SyncMCPResult{Status: status, Message: msg, Deleted: len(deleted)}, nil
 }
