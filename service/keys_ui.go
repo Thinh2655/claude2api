@@ -168,6 +168,36 @@ const keysPageHTML = `<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>Đồng bộ quyền riêng tư</h2>
+    <div class="switch-row">
+      <div>
+        <div>Siêu dữ liệu vị trí</div>
+        <div class="hint">Cho phép Claude sử dụng siêu dữ liệu vị trí gần đúng (thành phố/khu vực) để cải thiện trải nghiệm sản phẩm. Lưu vào cấu hình ENABLE_GEOLOCATION.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="geolocationToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row" style="margin-top:1rem;">
+      <div>
+        <div>Help improve our AI models</div>
+        <div class="hint">Cho phép sử dụng chat và phiên coding để huấn luyện/cải thiện mô hình AI của Anthropic. Lưu vào cấu hình ENABLE_GROVE.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="groveToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div style="display:flex; gap:.75rem; align-items:stretch; margin-top:1rem;">
+      <button class="btn-primary" id="privacySyncBtn" onclick="syncPrivacy()" style="flex:1;">Đồng bộ tất cả tài khoản</button>
+    </div>
+    <div class="msg" id="privacySyncMsg"></div>
+    <div class="hint">Công tắc chỉ là giá trị đích; bấm Đồng bộ để áp dụng cho toàn bộ tài khoản trong pool. Tài khoản thêm mới sau đó cần đồng bộ lại.</div>
+    <div id="privacySyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
+  </div>
+
+  <div class="card">
     <h2>Thêm tài khoản (dán cookie)</h2>
     <textarea id="newCookie" placeholder='Dán JSON mảng cookie (EditThisCookie/Cookie-Editor export) tại đây' autocomplete="off"></textarea>
     <button class="btn-primary" onclick="addAccount()">Thêm vào pool</button>
@@ -399,6 +429,58 @@ async function saveMCP(el) {
   }
 }
 
+async function loadPrivacy() {
+  const res = await fetch('/keys/api/privacy', { headers });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('geolocationToggle').checked = !!data.geolocation;
+  document.getElementById('groveToggle').checked = !!data.grove;
+}
+
+function setPrivacyBusy(busy) {
+  const btn = document.getElementById('privacySyncBtn');
+  btn.disabled = busy;
+  btn.style.opacity = busy ? '.5' : '';
+}
+
+async function syncPrivacy() {
+  const geolocation = document.getElementById('geolocationToggle').checked;
+  const grove = document.getElementById('groveToggle').checked;
+  const msg = document.getElementById('privacySyncMsg');
+  const resDiv = document.getElementById('privacySyncResults');
+  const detail = 'Siêu dữ liệu vị trí: ' + (geolocation ? 'BẬT' : 'TẮT') + '\nHelp improve our AI models: ' + (grove ? 'BẬT' : 'TẮT');
+  const warning = grove ? '\n\nCẢNH BÁO: bật "Help improve our AI models" cho phép dùng chat/coding session để huấn luyện model.' : '';
+  if (!confirm('Đồng bộ quyền riêng tư cho TOÀN BỘ tài khoản trong pool?\n\n' + detail + warning)) {
+    return;
+  }
+
+  setPrivacyBusy(true);
+  msg.textContent = 'Đang đồng bộ quyền riêng tư cho các tài khoản... Vui lòng đợi trong giây lát.';
+  msg.className = 'msg';
+  resDiv.innerHTML = '';
+
+  try {
+    const res = await fetch('/keys/api/privacy/sync', {
+      method: 'POST', headers,
+      body: JSON.stringify({ geolocation: geolocation, grove: grove })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msg.textContent = data.message || data.error || 'Đồng bộ thất bại';
+      msg.className = 'msg error';
+      return;
+    }
+    msg.textContent = data.message || 'Đồng bộ hoàn tất';
+    msg.className = 'msg success';
+    renderSyncResults(data.results, 'privacySyncResults');
+  } catch (e) {
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    setPrivacyBusy(false);
+  }
+}
+
 async function syncMCP() {
   const nameInput = document.getElementById('mcpSyncName');
   const urlInput = document.getElementById('mcpSyncUrl');
@@ -435,7 +517,7 @@ async function syncMCP() {
     }
     msg.textContent = data.message || 'Đồng bộ hoàn tất';
     msg.className = 'msg success';
-    renderMCPResults(data.results);
+    renderSyncResults(data.results);
   } catch (e) {
     msg.textContent = 'Lỗi kết nối: ' + e.message;
     msg.className = 'msg error';
@@ -472,7 +554,7 @@ async function deleteMCP() {
     }
     msg.textContent = data.message || 'Đã xóa MCP custom';
     msg.className = 'msg success';
-    renderMCPResults(data.results);
+    renderSyncResults(data.results);
   } catch (e) {
     msg.textContent = 'Lỗi kết nối: ' + e.message;
     msg.className = 'msg error';
@@ -489,8 +571,8 @@ function setMCPBusy(busy) {
   });
 }
 
-function renderMCPResults(results) {
-  const resDiv = document.getElementById('mcpSyncResults');
+function renderSyncResults(results, containerId) {
+  const resDiv = document.getElementById(containerId || 'mcpSyncResults');
   if (!results || !results.length) {
     resDiv.innerHTML = '';
     return;
@@ -686,6 +768,7 @@ loadKeys();
 loadTools();
 loadLastImage();
 loadMCP();
+loadPrivacy();
 loadRecentOnce();
 setInterval(loadKeys, 3000);
 setInterval(tickCountdowns, 1000);

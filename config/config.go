@@ -86,11 +86,16 @@ type Config struct {
 	EnableTools bool `yaml:"enableTools"`
 	// OnlyLastImage drops image_url parts from every message except the last
 	// one, so long histories don't re-upload old images on each request.
-	OnlyLastImage bool         `yaml:"onlyLastImage"`
-	EnableMCP     bool         `yaml:"enableMCP"`
-	EnableGateway bool         `yaml:"enableGateway"` // phục vụ giao diện claude.ai tại localhost
-	GatewayKey    string       `yaml:"gatewayKey"`    // sessionKey gateway ưu tiên dùng; rỗng = tự chọn
-	RwMutx        sync.RWMutex `yaml:"-"`             // 不从YAML加载
+	OnlyLastImage bool `yaml:"onlyLastImage"`
+	EnableMCP     bool `yaml:"enableMCP"`
+	// EnableGeolocation and EnableGrove are the target privacy settings applied
+	// by the dashboard's "sync all accounts" action. They are not used at
+	// request time; they only record what the next sync should set upstream.
+	EnableGeolocation bool         `yaml:"enableGeolocation"`
+	EnableGrove       bool         `yaml:"enableGrove"`
+	EnableGateway     bool         `yaml:"enableGateway"` // phục vụ giao diện claude.ai tại localhost
+	GatewayKey        string       `yaml:"gatewayKey"`    // sessionKey gateway ưu tiên dùng; rỗng = tự chọn
+	RwMutx            sync.RWMutex `yaml:"-"`             // 不从YAML加载
 }
 
 // 解析 SESSIONS 格式的环境变量
@@ -143,6 +148,14 @@ func (c *Config) MCPEnabled() bool {
 	c.RwMutx.RLock()
 	defer c.RwMutx.RUnlock()
 	return c.EnableMCP
+}
+
+// PrivacySyncSettings returns the target values for the two claude.ai privacy
+// settings synced by the dashboard (location metadata, model improvement).
+func (c *Config) PrivacySyncSettings() (bool, bool) {
+	c.RwMutx.RLock()
+	defer c.RwMutx.RUnlock()
+	return c.EnableGeolocation, c.EnableGrove
 }
 
 // SetGatewayKey stores the preferred gateway session key
@@ -437,7 +450,9 @@ func loadConfigFromYAML(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
 
-	var config Config
+	// Seed defaults before unmarshalling so a missing key keeps the intended
+	// default instead of the bool zero value.
+	config := Config{EnableGeolocation: true}
 	err = yaml.Unmarshal(data, &config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %v", err)
@@ -603,6 +618,10 @@ func loadConfigFromEnv() *Config {
 		OnlyLastImage: os.Getenv("ONLY_LAST_IMAGE") == "true",
 		// Hỗ trợ MCP tools
 		EnableMCP: os.Getenv("ENABLE_MCP") == "true",
+		// Giá trị đích khi đồng bộ privacy: location metadata mặc định bật
+		// (claude.ai coi null là bật), model improvement mặc định tắt.
+		EnableGeolocation: os.Getenv("ENABLE_GEOLOCATION") != "false",
+		EnableGrove:       os.Getenv("ENABLE_GROVE") == "true",
 		// 网关优先使用的 sessionKey（可选）
 		GatewayKey: os.Getenv("GATEWAY_KEY"),
 		// 设置读写锁
@@ -667,4 +686,6 @@ func init() {
 	logger.Info(fmt.Sprintf("EnableTools: %t", ConfigInstance.EnableTools))
 	logger.Info(fmt.Sprintf("OnlyLastImage: %t", ConfigInstance.OnlyLastImage))
 	logger.Info(fmt.Sprintf("EnableMCP: %t", ConfigInstance.EnableMCP))
+	logger.Info(fmt.Sprintf("EnableGeolocation: %t", ConfigInstance.EnableGeolocation))
+	logger.Info(fmt.Sprintf("EnableGrove: %t", ConfigInstance.EnableGrove))
 }

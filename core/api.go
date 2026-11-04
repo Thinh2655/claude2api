@@ -1363,6 +1363,7 @@ var allowedUserSettings = map[string]bool{
 	"enabled_foccacia":                 true,
 	"dismissed_claude_code_spotlight":  true,
 	"enabled_geolocation":              true,
+	"grove_enabled":                    true,
 	"enabled_mcp_tools":                true,
 	"paprika_mode":                     true,
 	"enabled_monkeys_in_a_barrel":      true,
@@ -1373,13 +1374,66 @@ var allowedUserSettings = map[string]bool{
 // PUT /api/account silently drops always-approved MCP keys. The PATCH merges
 // the map, so a nil value is required to remove an existing key.
 func (c *Client) UpdateUserSetting(key string, value interface{}) error {
-	if !allowedUserSettings[key] {
-		return fmt.Errorf("unknown setting key: %s", key)
+	return c.updateUserSettings(map[string]interface{}{key: value})
+}
+
+// UpdatePrivacySettings applies the two claude.ai privacy preferences in one
+// PATCH: coarse location metadata and use of chats/coding sessions for model
+// improvement.
+func (c *Client) UpdatePrivacySettings(enabledGeolocation, groveEnabled bool) error {
+	return c.updateUserSettings(map[string]interface{}{
+		"enabled_geolocation": enabledGeolocation,
+		"grove_enabled":       groveEnabled,
+	})
+}
+
+// accountPrivacySettings is the subset of /api/account.settings needed to
+// verify a privacy sync. Pointers preserve null: claude.ai treats a null
+// enabled_geolocation as enabled, while a null grove_enabled means the account
+// has not accepted the current privacy terms yet.
+type accountPrivacySettings struct {
+	EnabledGeolocation *bool `json:"enabled_geolocation"`
+	GroveEnabled       *bool `json:"grove_enabled"`
+}
+
+// GetAccountPrivacySettings reads back the privacy settings so the sync
+// handler can report warnings when a 202 response did not actually apply.
+func (c *Client) GetAccountPrivacySettings() (*bool, *bool, error) {
+	resp, err := c.client.R().
+		SetHeader("referer", "https://claude.ai/").
+		SetHeader("accept", "application/json").
+		Get("https://claude.ai/api/account")
+	if err != nil {
+		return nil, nil, fmt.Errorf("request failed: %w", err)
 	}
-	if m, ok := value.(map[string]interface{}); ok {
-		logger.Info(fmt.Sprintf("Updating setting %s (%d entries)", key, len(m)))
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	var acct struct {
+		Settings accountPrivacySettings `json:"settings"`
+	}
+	if err := json.Unmarshal(resp.Bytes(), &acct); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	return acct.Settings.EnabledGeolocation, acct.Settings.GroveEnabled, nil
+}
+
+func (c *Client) updateUserSettings(settings map[string]interface{}) error {
+	for key := range settings {
+		if !allowedUserSettings[key] {
+			return fmt.Errorf("unknown setting key: %s", key)
+		}
+	}
+	if len(settings) == 1 {
+		for key, value := range settings {
+			if m, ok := value.(map[string]interface{}); ok {
+				logger.Info(fmt.Sprintf("Updating setting %s (%d entries)", key, len(m)))
+			} else {
+				logger.Info(fmt.Sprintf("Updating setting %s to %v", key, value))
+			}
+		}
 	} else {
-		logger.Info(fmt.Sprintf("Updating setting %s to %v", key, value))
+		logger.Info(fmt.Sprintf("Updating %d account settings", len(settings)))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -1395,7 +1449,7 @@ func (c *Client) UpdateUserSetting(key string, value interface{}) error {
 		SetHeader("cache-control", "no-cache").
 		SetHeader("pragma", "no-cache").
 		SetHeader("priority", "u=1, i").
-		SetBody(map[string]interface{}{key: value}).
+		SetBody(settings).
 		Patch("https://claude.ai/api/account/settings")
 
 	if err != nil {

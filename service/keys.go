@@ -43,6 +43,20 @@ type keysResponse struct {
 // and delete connectors on the same accounts at once.
 var mcpOpMu sync.Mutex
 
+// privacySyncMu serializes privacy syncs so two dashboard actions cannot
+// overwrite each other's target values on the same accounts.
+var privacySyncMu sync.Mutex
+
+// envFileMu protects the read-modify-write in saveEnvLine from concurrent
+// dashboard toggles corrupting .env.
+var envFileMu sync.Mutex
+
+type privacySyncResult struct {
+	Account string `json:"account"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
 // maskKey hides the middle of a session key for display
 func maskKey(key string) string {
 	if len(key) <= 30 {
@@ -260,6 +274,117 @@ func MCPSetHandler(c *gin.Context) {
 		logger.Error(fmt.Sprintf("Failed to persist ENABLE_MCP to .env: %v", err))
 	}
 	c.JSON(http.StatusOK, gin.H{"enableMCP": body.Enabled})
+}
+
+// PrivacyGetHandler returns the target values used by the privacy sync.
+func PrivacyGetHandler(c *gin.Context) {
+	geolocation, grove := config.ConfigInstance.PrivacySyncSettings()
+	c.JSON(http.StatusOK, gin.H{"geolocation": geolocation, "grove": grove})
+}
+
+// PrivacySyncHandler applies the two privacy settings to every account in the
+// pool and records the target values in config and .env for the next load.
+func PrivacySyncHandler(c *gin.Context) {
+	var body struct {
+		Geolocation *bool `json:"geolocation"`
+		Grove       *bool `json:"grove"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Geolocation == nil || body.Grove == nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"geolocation\": true|false, \"grove\": true|false}"})
+		return
+	}
+	geolocation, grove := *body.Geolocation, *body.Grove
+
+	if !privacySyncMu.TryLock() {
+		c.JSON(http.StatusConflict, ErrorResponse{Error: "Đang có thao tác đồng bộ quyền riêng tư khác chạy, vui lòng thử lại sau"})
+		return
+	}
+	defer privacySyncMu.Unlock()
+
+	config.ConfigInstance.RwMutx.Lock()
+	config.ConfigInstance.EnableGeolocation = geolocation
+	config.ConfigInstance.EnableGrove = grove
+	config.ConfigInstance.RwMutx.Unlock()
+	if err := saveEnvLine("ENABLE_GEOLOCATION", fmt.Sprintf("%t", geolocation)); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist ENABLE_GEOLOCATION to .env: %v", err))
+	}
+	if err := saveEnvLine("ENABLE_GROVE", fmt.Sprintf("%t", grove)); err != nil {
+		logger.Error(fmt.Sprintf("Failed to persist ENABLE_GROVE to .env: %v", err))
+	}
+
+	config.ConfigInstance.RwMutx.RLock()
+	sessionsCopy := make([]config.SessionInfo, len(config.ConfigInstance.Sessions))
+	copy(sessionsCopy, config.ConfigInstance.Sessions)
+	config.ConfigInstance.RwMutx.RUnlock()
+
+	results := make([]privacySyncResult, len(sessionsCopy))
+	if len(sessionsCopy) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Không có tài khoản nào trong pool",
+			"results": results,
+		})
+		return
+	}
+
+	var wg sync.WaitGroup
+	// Limit concurrency to 3 to avoid hitting Claude rate limits or TLS connection surges
+	sem := make(chan struct{}, 3)
+	for i, s := range sessionsCopy {
+		wg.Add(1)
+		go func(idx int, sess config.SessionInfo) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			label := displayLabel(&sess)
+			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
+			if err := client.UpdatePrivacySettings(geolocation, grove); err != nil {
+				results[idx] = privacySyncResult{Account: label, Status: "error", Message: err.Error()}
+				logger.Warn(fmt.Sprintf("Privacy sync failed for account %s: %v", label, err))
+				return
+			}
+			gotGeo, gotGrove, err := client.GetAccountPrivacySettings()
+			if err != nil {
+				results[idx] = privacySyncResult{Account: label, Status: "warning", Message: "đã gửi nhưng không xác minh được: " + err.Error()}
+				logger.Warn(fmt.Sprintf("Privacy sync verification failed for account %s: %v", label, err))
+				return
+			}
+			msg, verified := privacyVerifyMessage(geolocation, grove, gotGeo, gotGrove)
+			if !verified {
+				results[idx] = privacySyncResult{Account: label, Status: "warning", Message: msg}
+				logger.Warn(fmt.Sprintf("Privacy sync warning for account %s: %s", label, msg))
+				return
+			}
+			results[idx] = privacySyncResult{Account: label, Status: "ok", Message: msg}
+			logger.Info(fmt.Sprintf("Privacy sync succeeded for account %s: %s", label, msg))
+		}(i, s)
+	}
+	wg.Wait()
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Đã hoàn thành đồng bộ quyền riêng tư",
+		"results": results,
+	})
+}
+
+func privacyVerifyMessage(wantGeo, wantGrove bool, gotGeo, gotGrove *bool) (string, bool) {
+	problems := make([]string, 0, 2)
+	if wantGeo {
+		if gotGeo != nil && !*gotGeo {
+			problems = append(problems, "enabled_geolocation vẫn tắt")
+		}
+	} else if gotGeo == nil || *gotGeo {
+		problems = append(problems, "enabled_geolocation vẫn bật/mặc định")
+	}
+	if gotGrove == nil {
+		problems = append(problems, "grove_enabled còn null (có thể chưa accept điều khoản)")
+	} else if *gotGrove != wantGrove {
+		problems = append(problems, fmt.Sprintf("grove_enabled=%t", *gotGrove))
+	}
+	if len(problems) > 0 {
+		return "đã gửi, chưa xác nhận: " + strings.Join(problems, "; "), false
+	}
+	return fmt.Sprintf("đã cập nhật (location=%t, improve_models=%t)", wantGeo, wantGrove), true
 }
 
 // MCPSyncHandler synchronizes all accounts with a new remote MCP server URL.
@@ -551,6 +676,9 @@ func resolveAccountEmail(s *config.SessionInfo) string {
 // Duplicate lines of the same key collapse into one; an empty value keeps the
 // line as "KEY=" so it can be filled in later.
 func saveEnvLine(name, value string) error {
+	envFileMu.Lock()
+	defer envFileMu.Unlock()
+
 	path := ".env"
 	newLine := name + "=" + value
 	lines := []string{}
