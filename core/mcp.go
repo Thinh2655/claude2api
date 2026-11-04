@@ -31,6 +31,14 @@ type remoteMCPServer struct {
 	URL  string `json:"url"`
 }
 
+type remoteMCPConnection struct {
+	UUID               string   `json:"uuid"`
+	ConnectionState    *string  `json:"connection_state"`
+	ConnectionAuthType *string  `json:"connection_auth_type"`
+	SignInPending      bool     `json:"sign_in_pending"`
+	Warnings           []string `json:"warnings"`
+}
+
 type remoteMCPTool struct {
 	Name              string                 `json:"name"`
 	Description       string                 `json:"description"`
@@ -366,6 +374,8 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 
 	// 3. Poll for tools from the newly created server (up to 10 seconds)
 	var toolsResp remoteMCPToolsResponse
+	lastToolsStatus := 0
+	var lastToolsErr error
 	toolsURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers/%s/tools", orgID, newServer.UUID)
 	for i := 0; i < 10; i++ {
 		time.Sleep(1 * time.Second)
@@ -376,12 +386,23 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 			SetHeader("referer", "https://claude.ai/chat").
 			Get(toolsURL)
 		tCancel()
-		if tErr == nil && tResp.StatusCode == http.StatusOK {
-			if jsonErr := json.Unmarshal(tResp.Bytes(), &toolsResp); jsonErr == nil && len(toolsResp.Tools) > 0 {
-				break
+		lastToolsStatus, lastToolsErr = 0, tErr
+		if tErr == nil {
+			lastToolsStatus = tResp.StatusCode
+			if tResp.StatusCode == http.StatusOK {
+				if jsonErr := json.Unmarshal(tResp.Bytes(), &toolsResp); jsonErr == nil && len(toolsResp.Tools) > 0 {
+					break
+				} else if jsonErr != nil {
+					lastToolsErr = jsonErr
+				}
 			}
 		}
 	}
+
+	// 3b. Read the connector's connection state. A connector can exist with a
+	// cached tool list while claude.ai has no live MCP connection, so the sync
+	// result must surface that instead of reporting plain success.
+	conn, connErr := c.fetchRemoteServerConnection(orgID, newServer.UUID)
 
 	// 4. Delete old remote servers (all except the newly created one)
 	deletedCount := 0
@@ -495,7 +516,55 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 	var warnings []string
 	if len(toolsResp.Tools) == 0 {
 		status = "warning"
-		msg = fmt.Sprintf("Đã xóa %d server cũ, %s nhưng chưa tải được danh sách tool", deletedCount, actionDesc)
+		msg = fmt.Sprintf("Đã xóa %d server cũ, %s nhưng chưa tải được danh sách tool nên chưa bật Always Allow", deletedCount, actionDesc)
+		if lastToolsStatus != 0 {
+			msg += fmt.Sprintf(" (claude.ai /tools trả %d)", lastToolsStatus)
+		} else if lastToolsErr != nil {
+			msg += fmt.Sprintf(" (%v)", lastToolsErr)
+		}
+	}
+	if connErr != nil {
+		warnings = append(warnings, fmt.Sprintf("không đọc được trạng thái kết nối: %v", connErr))
+	} else if conn == nil {
+		warnings = append(warnings, "không tìm thấy connector khi kiểm tra kết nối")
+	} else {
+		state := "null"
+		if conn.ConnectionState != nil && *conn.ConnectionState != "" {
+			state = *conn.ConnectionState
+		}
+		auth := ""
+		if conn.ConnectionAuthType != nil {
+			auth = *conn.ConnectionAuthType
+		}
+		if state != "connected" {
+			detail := fmt.Sprintf("connector chưa có kết nối thường trực (state=%s", state)
+			if auth != "" {
+				detail += ", auth=" + auth
+			}
+			if conn.SignInPending {
+				detail += ", đang chờ đăng nhập"
+			}
+			detail += ")"
+			alwaysOK := settingErr == nil && missingAlways == 0
+			switch {
+			case state == "null" && len(toolsResp.Tools) > 0 && alwaysOK:
+				detail += " - gọi tool qua API thường vẫn hoạt động; nếu dùng UI hãy Connect trên claude.ai"
+			case state == "null":
+				detail += " - cần Connect trên claude.ai hoặc kiểm tra MCP server"
+			case state == "error" && auth != "" && auth != "authless":
+				detail += " - sai loại auth hoặc cần đăng nhập lại"
+			default:
+				detail += " - cần Connect trên claude.ai hoặc MCP server đang down"
+			}
+			if len(conn.Warnings) > 0 {
+				w := strings.Join(conn.Warnings, "; ")
+				if len(w) > 200 {
+					w = w[:200] + "..."
+				}
+				detail += ": " + w
+			}
+			warnings = append(warnings, detail)
+		}
 	}
 	if missingAlways > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d tool thiếu always_approved_key", missingAlways))
@@ -516,6 +585,36 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 		Deleted:   deletedCount,
 		ToolCount: len(toolsResp.Tools),
 	}, nil
+}
+
+// fetchRemoteServerConnection reads one connector's live connection state from
+// claude.ai. A nil result means the connector was not found in the response.
+func (c *Client) fetchRemoteServerConnection(orgID, uuid string) (*remoteMCPConnection, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	resp, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("accept", "application/json").
+		SetHeader("referer", "https://claude.ai/chat").
+		Get(fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers_with_connection", orgID))
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status: %d", resp.StatusCode)
+	}
+
+	var servers []remoteMCPConnection
+	if err := json.Unmarshal(resp.Bytes(), &servers); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+	for i := range servers {
+		if servers[i].UUID == uuid {
+			return &servers[i], nil
+		}
+	}
+	return nil, nil
 }
 
 // listRemoteServers returns the custom remote MCP servers configured on the
