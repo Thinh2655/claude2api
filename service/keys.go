@@ -390,8 +390,13 @@ func privacyVerifyMessage(wantGeo, wantGrove bool, gotGeo, gotGrove *bool) (stri
 // MCPSyncHandler synchronizes all accounts with a new remote MCP server URL.
 func MCPSyncHandler(c *gin.Context) {
 	var body struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
+		Name         string           `json:"name"`
+		URL          string           `json:"url"`
+		AuthMode     string           `json:"authMode"`
+		Registration string           `json:"registration"`
+		ClientID     string           `json:"clientId"`
+		ClientSecret string           `json:"clientSecret"`
+		Headers      []core.MCPHeader `json:"headers"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Dữ liệu JSON không hợp lệ"})
@@ -405,6 +410,18 @@ func MCPSyncHandler(c *gin.Context) {
 	parsedURL, err := url.ParseRequestURI(mcpURL)
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "URL MCP không hợp lệ (phải bắt đầu bằng http:// hoặc https://)"})
+		return
+	}
+
+	install, err := core.BuildMCPInstall(mcpURL, core.MCPInstallOptions{
+		AuthMode:     body.AuthMode,
+		Registration: body.Registration,
+		ClientID:     body.ClientID,
+		ClientSecret: body.ClientSecret,
+		Headers:      body.Headers,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		return
 	}
 
@@ -441,7 +458,7 @@ func MCPSyncHandler(c *gin.Context) {
 
 			label := displayLabel(&sess)
 			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
-			res, syncErr := client.SyncRemoteMCP(mcpName, mcpURL)
+			res, syncErr := client.SyncRemoteMCP(mcpName, mcpURL, install)
 			if syncErr != nil {
 				results[idx] = core.SyncMCPResult{
 					Account: label,

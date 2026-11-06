@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,11 +27,69 @@ var (
 	mcpFetchMu sync.Map // per-org singleflight lock
 )
 
-type remoteMCPServer struct {
-	UUID string `json:"uuid"`
-	Name string `json:"name"`
-	URL  string `json:"url"`
+type remoteMCPInstallSummary struct {
+	Transport          string  `json:"transport"`
+	Posture            string  `json:"posture"`
+	SelectedMethodType *string `json:"selected_method_type"`
 }
+
+type remoteMCPServer struct {
+	UUID           string                   `json:"uuid"`
+	Name           string                   `json:"name"`
+	URL            string                   `json:"url"`
+	InstallSummary *remoteMCPInstallSummary `json:"install_summary"`
+}
+
+type MCPHeader struct {
+	Name     string `json:"name"`
+	Value    string `json:"value"`
+	Required bool   `json:"required"`
+}
+
+type MCPInstallOptions struct {
+	AuthMode     string      `json:"authMode"`
+	Registration string      `json:"registration"`
+	ClientID     string      `json:"clientId"`
+	ClientSecret string      `json:"clientSecret"`
+	Headers      []MCPHeader `json:"headers"`
+}
+
+type MCPInstall struct {
+	Type       string            `json:"type"`
+	Transport  string            `json:"transport"`
+	Posture    string            `json:"posture"`
+	AuthMethod *MCPAuthMethod    `json:"auth_method,omitempty"`
+	Inputs     []MCPInstallInput `json:"inputs"`
+}
+
+type MCPAuthMethod struct {
+	Type              string             `json:"type"`
+	Registration      *MCPRegistration   `json:"registration,omitempty"`
+	MCPRequestHeaders []MCPRequestHeader `json:"mcp_request_headers"`
+}
+
+type MCPRegistration struct {
+	Type             string               `json:"type"`
+	ClientCredential *MCPClientCredential `json:"client_credential,omitempty"`
+}
+
+type MCPClientCredential struct {
+	Type string `json:"type"`
+}
+
+type MCPRequestHeader struct {
+	Name     string `json:"name"`
+	Scope    string `json:"scope"`
+	Required bool   `json:"required"`
+}
+
+type MCPInstallInput struct {
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+var mcpHeaderNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
 type remoteMCPConnection struct {
 	UUID               string   `json:"uuid"`
@@ -237,11 +297,19 @@ func parseUpstreamError(body []byte) (message, existingUUID string) {
 	if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
 		return e.Error.Message, e.Error.Details.ExistingConnectorUUID
 	}
-	s := strings.TrimSpace(string(body))
-	if len(s) > 200 {
-		s = s[:200] + "..."
-	}
+	s := truncateText(strings.TrimSpace(string(body)), 200)
 	return s, ""
+}
+
+func truncateText(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 // SyncMCPResult holds the outcome of an MCP sync/delete operation for an account.
@@ -253,9 +321,232 @@ type SyncMCPResult struct {
 	ToolCount int    `json:"toolCount"`
 }
 
+func BuildMCPInstall(mcpURL string, opts MCPInstallOptions) (*MCPInstall, error) {
+	authMode := strings.TrimSpace(opts.AuthMode)
+	if authMode == "" {
+		authMode = "no_auth"
+	}
+	switch authMode {
+	case "no_auth", "defer_auth", "auth_required":
+	default:
+		return nil, fmt.Errorf("authMode không hợp lệ: %q", authMode)
+	}
+
+	registration := strings.TrimSpace(opts.Registration)
+	clientID := strings.TrimSpace(opts.ClientID)
+	clientSecret := strings.TrimSpace(opts.ClientSecret)
+	if authMode == "no_auth" && (registration != "" || clientID != "" || clientSecret != "") {
+		return nil, errors.New("registration/clientId/clientSecret chỉ dùng khi bật OAuth")
+	}
+	if authMode != "no_auth" {
+		switch registration {
+		case "cimd", "dcr", "static_per_installation":
+		case "":
+			return nil, errors.New("registration là bắt buộc khi dùng OAuth")
+		default:
+			return nil, fmt.Errorf("registration không hợp lệ: %q", registration)
+		}
+		if registration != "static_per_installation" && (clientID != "" || clientSecret != "") {
+			return nil, errors.New("clientId/clientSecret chỉ dùng với registration=static_per_installation")
+		}
+		if registration == "static_per_installation" && clientID == "" {
+			return nil, errors.New("clientId là bắt buộc khi registration=static_per_installation")
+		}
+	}
+
+	headers := make([]MCPHeader, 0, len(opts.Headers))
+	for _, raw := range opts.Headers {
+		name := strings.TrimSpace(raw.Name)
+		value := strings.TrimSpace(raw.Value)
+		if name == "" {
+			if value != "" {
+				return nil, errors.New("tên request header không được để trống")
+			}
+			continue
+		}
+		if len(headers) >= 4 {
+			return nil, errors.New("tối đa 4 request header")
+		}
+		if !validMCPHeaderName(name) {
+			return nil, fmt.Errorf("tên request header không hợp lệ: %q", name)
+		}
+		if !validMCPHeaderValue(value) {
+			return nil, fmt.Errorf("giá trị request header không hợp lệ: %q", name)
+		}
+		if raw.Required && value == "" {
+			return nil, fmt.Errorf("request header %q bắt buộc phải có value", name)
+		}
+		if authMode != "no_auth" && strings.EqualFold(name, "authorization") {
+			return nil, errors.New("header Authorization do OAuth quản lý, không khai báo trong request headers")
+		}
+		for _, prev := range headers {
+			if mcpHeaderNamesAlike(prev.Name, name) {
+				return nil, fmt.Errorf("request header bị trùng: %q", name)
+			}
+		}
+		headers = append(headers, MCPHeader{Name: name, Value: value, Required: raw.Required})
+	}
+
+	if authMode == "no_auth" && len(headers) > 0 {
+		hasValue := false
+		for _, h := range headers {
+			if h.Value != "" {
+				hasValue = true
+				break
+			}
+		}
+		if !hasValue {
+			return nil, errors.New("khi không dùng OAuth, cần ít nhất một request header có value")
+		}
+	}
+
+	definitions := make([]MCPRequestHeader, 0, len(headers))
+	values := make([]MCPInstallInput, 0, len(headers))
+	for _, h := range headers {
+		definitions = append(definitions, MCPRequestHeader{
+			Name:     h.Name,
+			Scope:    "organization",
+			Required: h.Required,
+		})
+		if h.Value != "" {
+			values = append(values, MCPInstallInput{
+				Type:  "mcp_request_header",
+				Name:  h.Name,
+				Value: h.Value,
+			})
+		}
+	}
+
+	install := &MCPInstall{
+		Type:      "custom",
+		Transport: mcpTransportForURL(mcpURL),
+		Inputs:    make([]MCPInstallInput, 0),
+	}
+
+	if authMode == "no_auth" {
+		if len(definitions) == 0 {
+			install.Posture = "no_auth"
+			return install, nil
+		}
+		install.Posture = "auth_required"
+		install.AuthMethod = &MCPAuthMethod{
+			Type:              "static_headers",
+			MCPRequestHeaders: definitions,
+		}
+		install.Inputs = values
+		return install, nil
+	}
+
+	install.Posture = authMode
+	authMethod := &MCPAuthMethod{
+		Type: "oauth",
+		Registration: &MCPRegistration{
+			Type: registration,
+		},
+		MCPRequestHeaders: definitions,
+	}
+	if registration == "static_per_installation" {
+		credentialType := "none"
+		if clientSecret != "" {
+			credentialType = "client_secret"
+		}
+		authMethod.Registration.ClientCredential = &MCPClientCredential{Type: credentialType}
+		install.Inputs = append(install.Inputs, MCPInstallInput{
+			Type:  "oauth_method_input",
+			Name:  "client_id",
+			Value: clientID,
+		})
+		if clientSecret != "" {
+			install.Inputs = append(install.Inputs, MCPInstallInput{
+				Type:  "oauth_client_credential",
+				Name:  "client_secret",
+				Value: clientSecret,
+			})
+		}
+	}
+	install.Inputs = append(install.Inputs, values...)
+	install.AuthMethod = authMethod
+	return install, nil
+}
+
+func validMCPHeaderName(name string) bool {
+	if !mcpHeaderNamePattern.MatchString(name) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if name[i] != '.' {
+			continue
+		}
+		if i == 0 || i == len(name)-1 || !isASCIIAlphaNum(name[i-1]) || !isASCIIAlphaNum(name[i+1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlphaNum(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
+func validMCPHeaderValue(value string) bool {
+	if len(value) > 4096 {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func mcpHeaderNamesAlike(a, b string) bool {
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	if !strings.Contains(a, ".") && !strings.Contains(b, ".") {
+		return false
+	}
+	normalize := func(s string) string {
+		s = strings.ToLower(s)
+		s = strings.ReplaceAll(s, ".", "-")
+		return strings.ReplaceAll(s, "_", "-")
+	}
+	return normalize(a) == normalize(b)
+}
+
+func mcpTransportForURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err == nil && strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/sse") {
+		return "sse"
+	}
+	return "streamable-http"
+}
+
+func normalizeMCPURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return strings.TrimRight(strings.TrimSpace(raw), "/")
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String()
+}
+
+func mcpServerMatchesDefaultInstall(server remoteMCPServer, install *MCPInstall) bool {
+	if server.InstallSummary == nil {
+		return true
+	}
+	summary := server.InstallSummary
+	return summary.Transport == install.Transport &&
+		summary.Posture == "no_auth" &&
+		(summary.SelectedMethodType == nil || *summary.SelectedMethodType == "")
+}
+
 // SyncRemoteMCP replaces existing custom remote MCP servers on the account with the new MCP URL and name,
 // then marks all its tools as always allowed (enabled_mcp_tools).
-func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
+func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*SyncMCPResult, error) {
 	orgID, err := c.GetOrgID()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get organization: %w", err)
@@ -265,110 +556,102 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 	if mcpName == "" {
 		mcpName = "mcp"
 	}
-	if len(mcpName) > 64 {
-		mcpName = mcpName[:64]
+	if runes := []rune(mcpName); len(runes) > 64 {
+		mcpName = string(runes[:64])
 	}
 
-	// 1. Fetch current remote servers to know what to delete
+	if install == nil {
+		install, err = BuildMCPInstall(mcpURL, MCPInstallOptions{})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	serversURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers", orgID)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	resp, err := c.client.R().
-		SetContext(ctx).
-		SetHeader("accept", "application/json").
-		SetHeader("referer", "https://claude.ai/chat").
-		Get(serversURL)
+	oldServers, err := c.listRemoteServers(orgID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list existing servers: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list existing servers status: %d", resp.StatusCode)
+		return nil, err
 	}
 
-	var oldServers []remoteMCPServer
-	if err := json.Unmarshal(resp.Bytes(), &oldServers); err != nil {
-		return nil, fmt.Errorf("failed to parse existing servers: %w", err)
-	}
-
-	normTargetURL := strings.TrimRight(strings.ToLower(mcpURL), "/")
+	normTargetURL := normalizeMCPURL(mcpURL)
+	wantReuse := install.Posture == "no_auth" && install.AuthMethod == nil && len(install.Inputs) == 0
 	var newServer remoteMCPServer
 	reused := false
+	renameWarn := ""
 
-	// Check if a connector with the exact same URL already exists in oldServers
-	for _, s := range oldServers {
-		if strings.TrimRight(strings.ToLower(s.URL), "/") == normTargetURL && s.UUID != "" {
+	if wantReuse {
+		for _, s := range oldServers {
+			if s.UUID == "" || normalizeMCPURL(s.URL) != normTargetURL || !mcpServerMatchesDefaultInstall(s, install) {
+				continue
+			}
 			newServer = s
 			reused = true
 			logger.Info(fmt.Sprintf("Found existing connector %s matching URL %s", s.UUID, mcpURL))
-			// If existing connector has different name, update name via PUT
 			if s.Name != mcpName {
-				putURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers/%s", orgID, s.UUID)
-				putBody := map[string]interface{}{"name": mcpName}
-				c.client.R().
-					SetHeader("accept", "application/json").
-					SetHeader("content-type", "application/json").
-					SetHeader("referer", "https://claude.ai/chat").
-					SetBody(putBody).
-					Put(putURL)
-				newServer.Name = mcpName
+				if err := c.renameRemoteServer(orgID, s.UUID, mcpName); err != nil {
+					renameWarn = fmt.Sprintf("không đổi được tên connector cũ: %v", err)
+				} else {
+					newServer.Name = mcpName
+				}
 			}
 			break
 		}
 	}
 
-	// 2. If not found in existing list, create the new remote server
+	deletedCount := 0
+	deletedUUIDs := make(map[string]bool)
+
 	if !reused {
 		createBody := map[string]interface{}{
-			"name":          mcpName,
-			"url":           mcpURL,
-			"id_jag_config": nil,
-			"attestations":  []interface{}{},
+			"name":         mcpName,
+			"url":          mcpURL,
+			"install":      install,
+			"attestations": []interface{}{},
 		}
-		createCtx, createCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer createCancel()
-
-		createResp, err := c.client.R().
-			SetContext(createCtx).
-			SetHeader("accept", "application/json").
-			SetHeader("content-type", "application/json").
-			SetHeader("referer", "https://claude.ai/chat").
-			SetBody(createBody).
-			Post(serversURL)
+		status, body, err := c.postRemoteMCPServer(serversURL, createBody)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create new MCP server: %w", err)
 		}
 
-		if createResp.StatusCode == http.StatusConflict {
-			// 409 Conflict: A connector with this URL already exists
-			errMsg, existingUUID := parseUpstreamError(createResp.Bytes())
-			if existingUUID != "" {
-				newServer.UUID = existingUUID
-				newServer.Name = mcpName
-				reused = true
-				logger.Info(fmt.Sprintf("409 Conflict: reusing existing connector UUID %s for URL %s", existingUUID, mcpURL))
-				// Try updating name
-				putURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers/%s", orgID, existingUUID)
-				putBody := map[string]interface{}{"name": mcpName}
-				c.client.R().
-					SetHeader("accept", "application/json").
-					SetHeader("content-type", "application/json").
-					SetHeader("referer", "https://claude.ai/chat").
-					SetBody(putBody).
-					Put(putURL)
-			} else {
+		if status == http.StatusConflict {
+			errMsg, existingUUID := parseUpstreamError(body)
+			if existingUUID == "" {
+				for _, s := range oldServers {
+					if s.UUID != "" && normalizeMCPURL(s.URL) == normTargetURL {
+						existingUUID = s.UUID
+						break
+					}
+				}
+			}
+			if existingUUID == "" {
 				return nil, fmt.Errorf("URL MCP này đã tồn tại trên tài khoản (409 Conflict: %s). Vui lòng kiểm tra lại Connectors trên claude.ai", errMsg)
 			}
-		} else if createResp.StatusCode != http.StatusOK && createResp.StatusCode != http.StatusCreated {
-			errMsg, _ := parseUpstreamError(createResp.Bytes())
-			return nil, fmt.Errorf("tạo MCP server thất bại (status %d): %s", createResp.StatusCode, errMsg)
-		} else {
-			if err := json.Unmarshal(createResp.Bytes(), &newServer); err != nil {
-				return nil, fmt.Errorf("failed to parse created MCP server response: %w", err)
+			if err := c.deleteRemoteServer(orgID, existingUUID); err != nil {
+				return nil, fmt.Errorf("connector cùng URL đã tồn tại nhưng không xóa được để tạo lại (%s): %w", existingUUID, err)
 			}
-			if newServer.UUID == "" {
-				return nil, errors.New("created MCP server returned empty UUID")
+			deletedCount++
+			deletedUUIDs[existingUUID] = true
+			logger.Info(fmt.Sprintf("409 Conflict: deleted connector %s, retrying create for URL %s", existingUUID, mcpURL))
+			time.Sleep(500 * time.Millisecond)
+			status, body, err = c.postRemoteMCPServer(serversURL, createBody)
+			if err != nil {
+				return nil, fmt.Errorf("đã xóa connector cũ nhưng tạo lại thất bại: %w", err)
 			}
+		}
+
+		if status == http.StatusConflict {
+			errMsg, _ := parseUpstreamError(body)
+			return nil, fmt.Errorf("URL MCP vẫn tồn tại sau khi xóa connector cũ (409 Conflict: %s)", errMsg)
+		}
+		if status != http.StatusOK && status != http.StatusCreated {
+			errMsg, _ := parseUpstreamError(body)
+			return nil, fmt.Errorf("tạo MCP server thất bại (status %d): %s", status, errMsg)
+		}
+		if err := json.Unmarshal(body, &newServer); err != nil {
+			return nil, fmt.Errorf("failed to parse created MCP server response: %w", err)
+		}
+		if newServer.UUID == "" {
+			return nil, errors.New("created MCP server returned empty UUID")
 		}
 	}
 
@@ -405,26 +688,25 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 	conn, connErr := c.fetchRemoteServerConnection(orgID, newServer.UUID)
 
 	// 4. Delete old remote servers (all except the newly created one)
-	deletedCount := 0
-	oldUUIDs := make(map[string]bool)
+	oldUUIDs := make(map[string]bool, len(oldServers)+1)
 	for _, old := range oldServers {
-		if old.UUID == "" || old.UUID == newServer.UUID {
+		if old.UUID != "" {
+			oldUUIDs[old.UUID] = true
+		}
+	}
+	for uuid := range deletedUUIDs {
+		oldUUIDs[uuid] = true
+	}
+	oldUUIDs[newServer.UUID] = true
+	for _, old := range oldServers {
+		if old.UUID == "" || old.UUID == newServer.UUID || deletedUUIDs[old.UUID] {
 			continue
 		}
-		oldUUIDs[old.UUID] = true
-		delURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers/%s", orgID, old.UUID)
-		dCtx, dCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		dResp, dErr := c.client.R().
-			SetContext(dCtx).
-			SetHeader("accept", "application/json").
-			SetHeader("referer", "https://claude.ai/chat").
-			Delete(delURL)
-		dCancel()
-		if dErr == nil && (dResp.StatusCode == http.StatusOK || dResp.StatusCode == http.StatusNoContent) {
-			deletedCount++
-		} else {
-			logger.Warn(fmt.Sprintf("Failed to delete old MCP server %s: %v", old.UUID, dErr))
+		if err := c.deleteRemoteServer(orgID, old.UUID); err != nil {
+			logger.Warn(fmt.Sprintf("Failed to delete old MCP server %s: %v", old.UUID, err))
+			continue
 		}
+		deletedCount++
 	}
 
 	// 5. Update enabled_mcp_tools setting (Always Allow).
@@ -509,11 +791,21 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 	actionDesc := "thêm MCP mới"
 	if reused {
 		actionDesc = "tái sử dụng connector hiện có"
+	} else if install.AuthMethod != nil {
+		switch install.AuthMethod.Type {
+		case "oauth":
+			actionDesc = "thêm MCP mới với OAuth"
+		case "static_headers":
+			actionDesc = "thêm MCP mới với request headers"
+		}
 	}
 
 	status := "ok"
 	msg := fmt.Sprintf("Đã xóa %d server cũ, %s với %d tool (Always Allow)", deletedCount, actionDesc, len(toolsResp.Tools))
 	var warnings []string
+	if renameWarn != "" {
+		warnings = append(warnings, renameWarn)
+	}
 	if len(toolsResp.Tools) == 0 {
 		status = "warning"
 		msg = fmt.Sprintf("Đã xóa %d server cũ, %s nhưng chưa tải được danh sách tool nên chưa bật Always Allow", deletedCount, actionDesc)
@@ -551,16 +843,15 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 				detail += " - gọi tool qua API thường vẫn hoạt động; nếu dùng UI hãy Connect trên claude.ai"
 			case state == "null":
 				detail += " - cần Connect trên claude.ai hoặc kiểm tra MCP server"
+			case state == "error" && install.AuthMethod != nil && install.AuthMethod.Type == "static_headers":
+				detail += " - kiểm tra request header/API key"
 			case state == "error" && auth != "" && auth != "authless":
 				detail += " - sai loại auth hoặc cần đăng nhập lại"
 			default:
 				detail += " - cần Connect trên claude.ai hoặc MCP server đang down"
 			}
 			if len(conn.Warnings) > 0 {
-				w := strings.Join(conn.Warnings, "; ")
-				if len(w) > 200 {
-					w = w[:200] + "..."
-				}
+				w := truncateText(strings.Join(conn.Warnings, "; "), 200)
 				detail += ": " + w
 			}
 			warnings = append(warnings, detail)
@@ -585,6 +876,45 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string) (*SyncMCPResult, error) {
 		Deleted:   deletedCount,
 		ToolCount: len(toolsResp.Tools),
 	}, nil
+}
+
+func (c *Client) postRemoteMCPServer(serversURL string, body map[string]interface{}) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	resp, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("accept", "application/json").
+		SetHeader("content-type", "application/json").
+		SetHeader("referer", "https://claude.ai/chat").
+		SetBody(body).
+		Post(serversURL)
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, resp.Bytes(), nil
+}
+
+func (c *Client) renameRemoteServer(orgID, uuid, name string) error {
+	putURL := fmt.Sprintf("https://claude.ai/api/organizations/%s/mcp/remote_servers/%s", orgID, uuid)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("accept", "application/json").
+		SetHeader("content-type", "application/json").
+		SetHeader("referer", "https://claude.ai/chat").
+		SetBody(map[string]interface{}{"name": name}).
+		Put(putURL)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		errMsg, _ := parseUpstreamError(resp.Bytes())
+		return fmt.Errorf("status %d: %s", resp.StatusCode, errMsg)
+	}
+	return nil
 }
 
 // fetchRemoteServerConnection reads one connector's live connection state from

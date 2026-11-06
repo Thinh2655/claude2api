@@ -57,12 +57,12 @@ const keysPageHTML = `<!DOCTYPE html>
   button:hover { opacity: .85; }
   .btn-danger { background: rgba(248,113,113,.15); color: var(--err); }
   .btn-primary { background: var(--accent); color: #fff; width: 100%; padding: .7rem; font-size: .95rem; }
-  input[type=text], textarea {
+  input[type=text], input[type=password], textarea {
     width: 100%; background: var(--bg); border: 1px solid var(--border);
     border-radius: 8px; padding: .7rem .9rem; color: var(--text);
     font-family: Consolas, monospace; font-size: .85rem; margin-bottom: .75rem;
   }
-  input[type=text]:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  input[type=text]:focus, input[type=password]:focus, textarea:focus { outline: none; border-color: var(--accent); }
   textarea { min-height: 120px; resize: vertical; }
   .msg { margin-top: .75rem; font-size: .85rem; min-height: 1.2em; }
   .msg.error { color: var(--err); }
@@ -80,6 +80,26 @@ const keysPageHTML = `<!DOCTYPE html>
   .gw-row select { flex: 1; margin-bottom: 0; }
   .gw-row button { white-space: nowrap; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); }
+  .mcp-form-grid { display: flex; gap: .75rem; align-items: flex-end; margin-bottom: .75rem; }
+  .mcp-form-grid > div { flex: 1; min-width: 0; }
+  .mcp-form-grid > div.mcp-url-field { flex: 2; }
+  .mcp-form-grid input, .mcp-field select { margin-bottom: 0; }
+  .mcp-field { margin-bottom: .75rem; }
+  .mcp-field-label { display: block; font-size: .78rem; color: var(--muted); margin-bottom: .35rem; }
+  .mcp-section { margin-top: .75rem; padding-top: .75rem; border-top: 1px solid var(--border); }
+  .mcp-section-title { font-weight: 600; font-size: .88rem; margin-bottom: .35rem; }
+  .mcp-header-row { display: flex; gap: .5rem; align-items: center; margin-top: .5rem; flex-wrap: wrap; }
+  .mcp-header-row input[type=text], .mcp-header-row input[type=password] {
+    margin-bottom: 0; flex: 1 1 120px;
+  }
+  .mcp-header-row .mcp-header-name { flex: 1 1 150px; }
+  .mcp-header-row .mcp-header-value { flex: 2 1 180px; }
+  .mcp-header-row button { padding: .4rem .6rem; }
+  .mcp-required { display: flex; align-items: center; gap: .3rem; font-size: .8rem;
+    color: var(--muted); white-space: nowrap; }
+  .mcp-add-header { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    margin-top: .5rem; }
+  .mcp-add-header:disabled { opacity: .4; cursor: not-allowed; }
   .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
   .switch { position: relative; display: inline-block; width: 46px; height: 26px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; }
@@ -154,16 +174,58 @@ const keysPageHTML = `<!DOCTYPE html>
 
   <div class="card">
     <h2>Đồng bộ MCP</h2>
-    <div style="display:flex; gap:.75rem; margin-bottom:.75rem;">
-      <input type="text" id="mcpSyncName" placeholder="Tên MCP (vd: tool)" autocomplete="off" value="tool" style="width:160px; margin-bottom:0;">
-      <input type="text" id="mcpSyncUrl" placeholder="URL MCP (vd: https://tool.kalei.site/mcp)" autocomplete="off" value="https://tool.kalei.site/mcp" style="flex:1; margin-bottom:0;">
+    <div class="mcp-form-grid">
+      <div>
+        <label class="mcp-field-label" for="mcpSyncName">Tên MCP</label>
+        <input type="text" id="mcpSyncName" placeholder="Tên MCP (vd: tool)" autocomplete="off" value="tool">
+      </div>
+      <div class="mcp-url-field">
+        <label class="mcp-field-label" for="mcpSyncUrl">URL MCP</label>
+        <input type="text" id="mcpSyncUrl" placeholder="URL MCP (vd: https://tool.kalei.site/mcp)" autocomplete="off" value="https://tool.kalei.site/mcp">
+      </div>
     </div>
-    <div style="display:flex; gap:.75rem; align-items:stretch;">
+    <div class="mcp-field">
+      <label class="mcp-field-label" for="mcpAuthMode">Xác thực</label>
+      <select id="mcpAuthMode" onchange="updateMCPAuthUI()">
+        <option value="auth_required">Đăng nhập ngay</option>
+        <option value="defer_auth">Đăng nhập khi cần</option>
+        <option value="no_auth" selected>Không đăng nhập</option>
+      </select>
+      <div class="hint" id="mcpAuthHint"></div>
+    </div>
+    <div id="mcpOAuthFields" style="display:none;">
+      <div class="mcp-field">
+        <label class="mcp-field-label" for="mcpRegistration">OAuth client</label>
+        <select id="mcpRegistration" onchange="updateMCPAuthUI()">
+          <option value="cimd">Dùng danh tính Claude (CIMD) - khuyến nghị</option>
+          <option value="dcr">Đăng ký client tự động (DCR)</option>
+          <option value="static_per_installation">Dùng OAuth client riêng</option>
+        </select>
+      </div>
+      <div id="mcpStaticOAuthFields" style="display:none;">
+        <div class="mcp-field">
+          <label class="mcp-field-label" for="mcpClientId">OAuth client ID</label>
+          <input type="text" id="mcpClientId" placeholder="Client ID" autocomplete="off">
+        </div>
+        <div class="mcp-field">
+          <label class="mcp-field-label" for="mcpClientSecret">OAuth client secret</label>
+          <input type="password" id="mcpClientSecret" placeholder="Client secret (không bắt buộc)" autocomplete="new-password">
+        </div>
+      </div>
+    </div>
+    <div class="mcp-section">
+      <div class="mcp-section-title">Request headers</div>
+      <div class="hint">Tối đa 4 header. Header có value sẽ được gửi kèm; header không có value vẫn được khai báo nếu không đánh dấu Bắt buộc.</div>
+      <div id="mcpHeaderRows"></div>
+      <button type="button" class="mcp-add-header" id="mcpAddHeaderBtn" onclick="addMCPHeader()">+ Thêm header</button>
+      <div class="hint" id="mcpHeaderCount"></div>
+    </div>
+    <div style="display:flex; gap:.75rem; align-items:stretch; margin-top:1rem;">
       <button class="btn-primary" id="mcpSyncBtn" onclick="syncMCP()" style="flex:1;">Đồng bộ tất cả tài khoản</button>
       <button class="btn-danger" id="mcpDeleteBtn" onclick="deleteMCP()" style="white-space:nowrap;">Xóa MCP custom</button>
     </div>
     <div class="msg" id="mcpSyncMsg"></div>
-    <div class="hint">Đồng bộ: xóa tất cả remote MCP custom cũ của từng tài khoản trong pool và thêm MCP mới với tên và URL trên (chế độ no auth, các tool luôn được bật Always Allow).<br>Xóa MCP custom: xóa toàn bộ remote MCP custom của tất cả tài khoản, không thêm mới và không thể hoàn tác.</div>
+    <div class="hint">Đồng bộ: xóa tất cả remote MCP custom cũ của từng tài khoản trong pool và thêm MCP mới với cấu hình xác thực/header bên trên (các tool luôn được bật Always Allow). Connector dùng OAuth có thể cần đăng nhập trên claude.ai sau khi tạo.<br>OAuth client ID/secret và giá trị header chỉ dùng cho lần đồng bộ này, không lưu vào .env.<br>Xóa MCP custom: xóa toàn bộ remote MCP custom của tất cả tài khoản, không thêm mới và không thể hoàn tác.</div>
     <div id="mcpSyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
   </div>
 
@@ -481,6 +543,125 @@ async function syncPrivacy() {
   }
 }
 
+function updateMCPAuthUI() {
+  const modeEl = document.getElementById('mcpAuthMode');
+  const regEl = document.getElementById('mcpRegistration');
+  if (!modeEl || !regEl) return;
+  const mode = modeEl.value;
+  const oauth = mode !== 'no_auth';
+  document.getElementById('mcpOAuthFields').style.display = oauth ? '' : 'none';
+  document.getElementById('mcpStaticOAuthFields').style.display = oauth && regEl.value === 'static_per_installation' ? '' : 'none';
+
+  const hint = document.getElementById('mcpAuthHint');
+  if (mode === 'auth_required') {
+    hint.textContent = 'Mỗi người dùng phải đăng nhập qua OAuth của server trước khi dùng tool.';
+  } else if (mode === 'defer_auth') {
+    hint.textContent = 'Claude kết nối trước, chỉ yêu cầu đăng nhập khi server cần. Phù hợp server có tool công khai.';
+  } else {
+    hint.textContent = 'Không dùng OAuth. Nếu khai báo request header, connector sẽ dùng static headers (ví dụ API key).';
+  }
+}
+
+function addMCPHeader(name, value, required) {
+  const rows = document.getElementById('mcpHeaderRows');
+  if (!rows) return;
+  if (rows.children.length >= 4) return;
+
+  const row = document.createElement('div');
+  row.className = 'mcp-header-row';
+
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameInput.className = 'mcp-header-name';
+  nameInput.placeholder = 'Tên header (vd: X-Api-Key)';
+  nameInput.maxLength = 64;
+  nameInput.autocomplete = 'off';
+  nameInput.value = name || '';
+
+  const valueInput = document.createElement('input');
+  valueInput.type = 'password';
+  valueInput.className = 'mcp-header-value';
+  valueInput.placeholder = 'Giá trị header';
+  valueInput.autocomplete = 'new-password';
+  valueInput.value = value || '';
+
+  const requiredLabel = document.createElement('label');
+  requiredLabel.className = 'mcp-required';
+  const requiredInput = document.createElement('input');
+  requiredInput.type = 'checkbox';
+  requiredInput.className = 'mcp-header-required';
+  requiredInput.checked = required !== false;
+  requiredLabel.appendChild(requiredInput);
+  requiredLabel.appendChild(document.createTextNode(' Bắt buộc'));
+
+  const removeButton = document.createElement('button');
+  removeButton.type = 'button';
+  removeButton.className = 'btn-danger';
+  removeButton.textContent = 'Xóa';
+  removeButton.onclick = function() { removeMCPHeader(this); };
+
+  row.appendChild(nameInput);
+  row.appendChild(valueInput);
+  row.appendChild(requiredLabel);
+  row.appendChild(removeButton);
+  rows.appendChild(row);
+  updateMCPHeaderControls();
+}
+
+function removeMCPHeader(button) {
+  const row = button.closest('.mcp-header-row');
+  if (row) row.remove();
+  updateMCPHeaderControls();
+}
+
+function updateMCPHeaderControls() {
+  const rows = document.getElementById('mcpHeaderRows');
+  const addBtn = document.getElementById('mcpAddHeaderBtn');
+  const count = rows ? rows.children.length : 0;
+  if (addBtn) addBtn.disabled = count >= 4;
+  const hint = document.getElementById('mcpHeaderCount');
+  if (hint) hint.textContent = count ? count + '/4 header' : 'Chưa có header nào';
+}
+
+function collectMCPHeaders() {
+  const headers = [];
+  document.querySelectorAll('#mcpHeaderRows .mcp-header-row').forEach(function(row) {
+    const nameInput = row.querySelector('.mcp-header-name');
+    const valueInput = row.querySelector('.mcp-header-value');
+    const requiredInput = row.querySelector('.mcp-header-required');
+    const name = (nameInput.value || '').trim();
+    const value = (valueInput.value || '').trim();
+    if (!name && !value) return;
+    headers.push({ name: name, value: value, required: !!(requiredInput && requiredInput.checked) });
+  });
+  return headers;
+}
+
+function validateMCPHeaders(headers, authMode) {
+  if (headers.length > 4) return 'Tối đa 4 request header';
+  const seen = new Set();
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    if (!h.name) return 'Tên request header không được để trống';
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(h.name)) return 'Tên request header không hợp lệ: ' + h.name;
+    const lower = h.name.toLowerCase();
+    if (seen.has(lower)) return 'Request header bị trùng: ' + h.name;
+    seen.add(lower);
+    if (h.required && !h.value) return 'Header ' + h.name + ' bắt buộc phải có value';
+    if (authMode !== 'no_auth' && lower === 'authorization') return 'Header Authorization do OAuth quản lý';
+  }
+  if (authMode === 'no_auth' && headers.length > 0 && headers.every(function(h) { return !h.value; })) {
+    return 'Khi không dùng OAuth, cần ít nhất một request header có value';
+  }
+  return '';
+}
+
+function initMCPForm() {
+  updateMCPAuthUI();
+  const rows = document.getElementById('mcpHeaderRows');
+  if (rows && rows.children.length === 0) addMCPHeader();
+}
+
 async function syncMCP() {
   const nameInput = document.getElementById('mcpSyncName');
   const urlInput = document.getElementById('mcpSyncUrl');
@@ -488,6 +669,11 @@ async function syncMCP() {
   const url = (urlInput.value || '').trim();
   const msg = document.getElementById('mcpSyncMsg');
   const resDiv = document.getElementById('mcpSyncResults');
+  const authModeEl = document.getElementById('mcpAuthMode');
+  const registrationEl = document.getElementById('mcpRegistration');
+  const authMode = authModeEl ? authModeEl.value : 'no_auth';
+  const registration = registrationEl ? registrationEl.value : 'cimd';
+  const requestHeaders = collectMCPHeaders();
 
   if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
     msg.textContent = 'Vui lòng nhập URL MCP hợp lệ (bắt đầu bằng http:// hoặc https://)';
@@ -495,7 +681,46 @@ async function syncMCP() {
     return;
   }
 
-  if (!confirm('Bạn có chắc muốn xóa tất cả MCP cũ và đồng bộ MCP mới (Tên: ' + name + ', URL: ' + url + ') cho TOÀN BỘ tài khoản trong pool không?')) {
+  const headerErr = validateMCPHeaders(requestHeaders, authMode);
+  if (headerErr) {
+    msg.textContent = headerErr;
+    msg.className = 'msg error';
+    return;
+  }
+
+  let clientId = '';
+  let clientSecret = '';
+  if (authMode !== 'no_auth' && registration === 'static_per_installation') {
+    const clientIdEl = document.getElementById('mcpClientId');
+    const clientSecretEl = document.getElementById('mcpClientSecret');
+    clientId = (clientIdEl.value || '').trim();
+    clientSecret = (clientSecretEl.value || '').trim();
+    if (!clientId) {
+      msg.textContent = 'Vui lòng nhập OAuth client ID khi dùng OAuth client riêng';
+      msg.className = 'msg error';
+      return;
+    }
+  }
+
+  const authLabels = { auth_required: 'Đăng nhập ngay', defer_auth: 'Đăng nhập khi cần', no_auth: 'Không đăng nhập' };
+  const regLabels = { cimd: 'CIMD', dcr: 'DCR', static_per_installation: 'OAuth client riêng' };
+  let confirmText = 'Bạn có chắc muốn xóa tất cả MCP cũ và đồng bộ MCP mới cho TOÀN BỘ tài khoản trong pool không?\n\n' +
+    'Tên: ' + name + '\nURL: ' + url + '\nXác thực: ' + (authLabels[authMode] || authMode);
+  if (requestHeaders.length) {
+    confirmText += '\nRequest headers: ' + requestHeaders.length;
+  }
+  if (authMode !== 'no_auth') {
+    confirmText += '\nOAuth client: ' + (regLabels[registration] || registration);
+    if (registration === 'static_per_installation') {
+      confirmText += clientSecret ? ' (có client secret)' : ' (không có client secret)';
+    }
+    confirmText += '\n\nConnector OAuth có thể cần đăng nhập trên claude.ai sau khi tạo.';
+  }
+  if (authMode === 'no_auth' && requestHeaders.length) {
+    confirmText += '\n\nRequest header sẽ được gửi dưới dạng static headers.';
+  }
+
+  if (!confirm(confirmText)) {
     return;
   }
 
@@ -505,9 +730,17 @@ async function syncMCP() {
   resDiv.innerHTML = '';
 
   try {
+    const payload = { name: name, url: url, authMode: authMode, headers: requestHeaders };
+    if (authMode !== 'no_auth') {
+      payload.registration = registration;
+      if (registration === 'static_per_installation') {
+        payload.clientId = clientId;
+        payload.clientSecret = clientSecret;
+      }
+    }
     const res = await fetch('/keys/api/mcp/sync', {
       method: 'POST', headers,
-      body: JSON.stringify({ name: name, url: url })
+      body: JSON.stringify(payload)
     });
     const data = await res.json();
     if (!res.ok) {
@@ -564,11 +797,13 @@ async function deleteMCP() {
 }
 
 function setMCPBusy(busy) {
-  ['mcpSyncBtn', 'mcpDeleteBtn'].forEach(function(id) {
+  ['mcpSyncBtn', 'mcpDeleteBtn', 'mcpAddHeaderBtn'].forEach(function(id) {
     const el = document.getElementById(id);
+    if (!el) return;
     el.disabled = busy;
     el.style.opacity = busy ? '.5' : '';
   });
+  if (!busy) updateMCPHeaderControls();
 }
 
 function renderSyncResults(results, containerId) {
@@ -768,6 +1003,7 @@ loadKeys();
 loadTools();
 loadLastImage();
 loadMCP();
+initMCPForm();
 loadPrivacy();
 loadRecentOnce();
 setInterval(loadKeys, 3000);
