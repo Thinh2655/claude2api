@@ -3,7 +3,6 @@ package core
 import (
 	"claude2api/config"
 	"claude2api/logger"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -56,13 +55,13 @@ func NewGatewayHandler() http.Handler {
 		req.Host = "claude.ai"
 		gatewayRewriteRequest(req)
 		if strings.Contains(req.URL.Path, "/completion") {
-			logger.Info(fmt.Sprintf("gateway completion %s — headers: %v", req.URL.Path, req.Header))
+			logger.Info("gateway completion %s — headers: %v", req.URL.Path, req.Header)
 		}
 	}
 	h.proxy.ModifyResponse = gatewayModifyResponse
 	h.proxy.FlushInterval = 100 * time.Millisecond // stream SSE promptly
 	h.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		logger.Error(fmt.Sprintf("gateway error for %s %s: %v", r.Method, r.URL.Path, err))
+		logger.Error("gateway error for %s %s: %v", r.Method, r.URL.Path, err)
 		w.WriteHeader(http.StatusBadGateway)
 	}
 	return h

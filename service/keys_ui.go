@@ -260,6 +260,26 @@ const keysPageHTML = `<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>Bộ nhớ</h2>
+    <div class="switch-row">
+      <div>
+        <div>Tạo bộ nhớ từ đoạn chat</div>
+        <div class="hint">Cho phép Claude tạo bộ nhớ từ các đoạn chat của bạn. Lưu vào cấu hình ENABLE_MEMORY.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="memoryToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div style="display:flex; gap:.75rem; align-items:stretch; margin-top:1rem;">
+      <button class="btn-primary" id="memorySyncBtn" onclick="syncMemory()" style="flex:1;">Đồng bộ tất cả tài khoản</button>
+    </div>
+    <div class="msg" id="memorySyncMsg"></div>
+    <div class="hint">Công tắc chỉ là giá trị đích; bấm Đồng bộ để áp dụng cho toàn bộ tài khoản trong pool. Tắt chỉ dừng tạo bộ nhớ mới, không xóa bộ nhớ đã có. Tài khoản Team/Enterprise có thể bị quản trị viên tổ chức khóa.</div>
+    <div id="memorySyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
+  </div>
+
+  <div class="card">
     <h2>Thêm tài khoản (dán cookie)</h2>
     <textarea id="newCookie" placeholder='Dán JSON mảng cookie (EditThisCookie/Cookie-Editor export) tại đây' autocomplete="off"></textarea>
     <button class="btn-primary" onclick="addAccount()">Thêm vào pool</button>
@@ -540,6 +560,56 @@ async function syncPrivacy() {
     msg.className = 'msg error';
   } finally {
     setPrivacyBusy(false);
+  }
+}
+
+async function loadMemory() {
+  const res = await fetch('/keys/api/memory', { headers });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('memoryToggle').checked = !!data.memory;
+}
+
+function setMemoryBusy(busy) {
+  const btn = document.getElementById('memorySyncBtn');
+  btn.disabled = busy;
+  btn.style.opacity = busy ? '.5' : '';
+}
+
+async function syncMemory() {
+  const enabled = document.getElementById('memoryToggle').checked;
+  const msg = document.getElementById('memorySyncMsg');
+  const resDiv = document.getElementById('memorySyncResults');
+  const detail = 'Tạo bộ nhớ từ đoạn chat: ' + (enabled ? 'BẬT' : 'TẮT');
+  const warning = enabled ? '\n\nCẢNH BÁO: bật bộ nhớ cho phép Claude lưu thông tin từ các cuộc chat và dùng lại trong các request sau.' : '';
+  if (!confirm('Đồng bộ cài đặt bộ nhớ cho TOÀN BỘ tài khoản trong pool?\n\n' + detail + warning)) {
+    return;
+  }
+
+  setMemoryBusy(true);
+  msg.textContent = 'Đang đồng bộ bộ nhớ cho các tài khoản... Vui lòng đợi trong giây lát.';
+  msg.className = 'msg';
+  resDiv.innerHTML = '';
+
+  try {
+    const res = await fetch('/keys/api/memory/sync', {
+      method: 'POST', headers,
+      body: JSON.stringify({ enabled: enabled })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msg.textContent = data.message || data.error || 'Đồng bộ thất bại';
+      msg.className = 'msg error';
+      return;
+    }
+    msg.textContent = data.message || 'Đồng bộ hoàn tất';
+    msg.className = 'msg success';
+    renderSyncResults(data.results, 'memorySyncResults');
+  } catch (e) {
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    setMemoryBusy(false);
   }
 }
 
@@ -1005,6 +1075,7 @@ loadLastImage();
 loadMCP();
 initMCPForm();
 loadPrivacy();
+loadMemory();
 loadRecentOnce();
 setInterval(loadKeys, 3000);
 setInterval(tickCountdowns, 1000);

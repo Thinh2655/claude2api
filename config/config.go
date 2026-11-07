@@ -41,11 +41,11 @@ type SessionInfo struct {
 	mu *sync.Mutex `yaml:"-"`
 }
 
-func (s *SessionInfo) Lock() {
+func (s *SessionInfo) LockSession() {
 	s.mu.Lock()
 }
 
-func (s *SessionInfo) Unlock() {
+func (s *SessionInfo) UnlockSession() {
 	s.mu.Unlock()
 }
 
@@ -88,11 +88,13 @@ type Config struct {
 	// one, so long histories don't re-upload old images on each request.
 	OnlyLastImage bool `yaml:"onlyLastImage"`
 	EnableMCP     bool `yaml:"enableMCP"`
-	// EnableGeolocation and EnableGrove are the target privacy settings applied
-	// by the dashboard's "sync all accounts" action. They are not used at
-	// request time; they only record what the next sync should set upstream.
+	// EnableGeolocation, EnableGrove and EnableMemory are the target claude.ai
+	// settings applied by the dashboard's "sync all accounts" actions. They are
+	// not used at request time; they only record what the next sync should set
+	// upstream.
 	EnableGeolocation bool         `yaml:"enableGeolocation"`
 	EnableGrove       bool         `yaml:"enableGrove"`
+	EnableMemory      bool         `yaml:"enableMemory"`
 	EnableGateway     bool         `yaml:"enableGateway"` // phục vụ giao diện claude.ai tại localhost
 	GatewayKey        string       `yaml:"gatewayKey"`    // sessionKey gateway ưu tiên dùng; rỗng = tự chọn
 	RwMutx            sync.RWMutex `yaml:"-"`             // 不从YAML加载
@@ -158,6 +160,14 @@ func (c *Config) PrivacySyncSettings() (bool, bool) {
 	return c.EnableGeolocation, c.EnableGrove
 }
 
+// MemorySyncSettings returns the target value for claude.ai's "Generate memory
+// from chats" setting.
+func (c *Config) MemorySyncSettings() bool {
+	c.RwMutx.RLock()
+	defer c.RwMutx.RUnlock()
+	return c.EnableMemory
+}
+
 // SetGatewayKey stores the preferred gateway session key
 func (c *Config) SetGatewayKey(key string) {
 	c.RwMutx.Lock()
@@ -221,7 +231,7 @@ func (c *Config) SetSessionOrgID(sessionKey, orgID string) {
 	defer c.RwMutx.Unlock()
 	for i := range c.Sessions {
 		if c.Sessions[i].SessionKey == sessionKey {
-			logger.Info(fmt.Sprintf("Setting OrgID for session %s to %s", sessionKey, orgID))
+			logger.Info("Setting OrgID for session %s to %s", sessionKey, orgID)
 			c.Sessions[i].OrgID = orgID
 			return
 		}
@@ -452,7 +462,7 @@ func loadConfigFromYAML(configPath string) (*Config, error) {
 
 	// Seed defaults before unmarshalling so a missing key keeps the intended
 	// default instead of the bool zero value.
-	config := Config{EnableGeolocation: true}
+	config := Config{EnableGeolocation: true, EnableMemory: true}
 	err = yaml.Unmarshal(data, &config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %v", err)
@@ -527,7 +537,7 @@ func LoadSessionFromCookie(cookiePath string) (SessionInfo, bool) {
 	}
 	var cookies []CookieFile
 	if err := json.Unmarshal(data, &cookies); err != nil {
-		logger.Error(fmt.Sprintf("Failed to parse cookie file %s: %v", cookiePath, err))
+		logger.Error("Failed to parse cookie file %s: %v", cookiePath, err)
 		return SessionInfo{}, false
 	}
 	return buildSessionFromCookies("", cookies)
@@ -559,7 +569,7 @@ func LoadCookieAccounts(accountsPath string) ([]SessionInfo, bool) {
 	}
 	var accounts []CookieAccount
 	if err := json.Unmarshal(data, &accounts); err != nil {
-		logger.Error(fmt.Sprintf("Failed to parse %s: %v", accountsPath, err))
+		logger.Error("Failed to parse %s: %v", accountsPath, err)
 		return out, ok
 	}
 	for _, a := range accounts {
@@ -622,6 +632,8 @@ func loadConfigFromEnv() *Config {
 		// (claude.ai coi null là bật), model improvement mặc định tắt.
 		EnableGeolocation: os.Getenv("ENABLE_GEOLOCATION") != "false",
 		EnableGrove:       os.Getenv("ENABLE_GROVE") == "true",
+		// Bộ nhớ ("Tạo bộ nhớ từ đoạn chat") mặc định bật như claude.ai.
+		EnableMemory: os.Getenv("ENABLE_MEMORY") != "false",
 		// 网关优先使用的 sessionKey（可选）
 		GatewayKey: os.Getenv("GATEWAY_KEY"),
 		// 设置读写锁
@@ -643,13 +655,13 @@ func LoadConfig() *Config {
 	// 检查配置文件是否存在
 	exists, configPath := configFileExists()
 	if exists {
-		logger.Info(fmt.Sprintf("Found config file at %s", configPath))
+		logger.Info("Found config file at %s", configPath)
 		config, err := loadConfigFromYAML(configPath)
 		if err == nil {
 			logger.Info("Successfully loaded configuration from YAML file")
 			return config
 		}
-		logger.Error(fmt.Sprintf("Failed to load config from YAML: %v, falling back to environment variables", err))
+		logger.Error("Failed to load config from YAML: %v, falling back to environment variables", err)
 	}
 
 	// 如果配置文件不存在或加载失败，从环境变量加载
@@ -671,21 +683,22 @@ func init() {
 	ConfigInstance = LoadConfig()
 	logger.Info("Loaded config:")
 	for i := range ConfigInstance.Sessions {
-		logger.Info(fmt.Sprintf("Session: %s, OrgID: %s", ConfigInstance.Sessions[i].SessionKey, ConfigInstance.Sessions[i].OrgID))
+		logger.Info("Session: %s, OrgID: %s", ConfigInstance.Sessions[i].SessionKey, ConfigInstance.Sessions[i].OrgID)
 	}
-	logger.Info(fmt.Sprintf("Address: %s", ConfigInstance.Address))
-	logger.Info(fmt.Sprintf("APIKey: %s", ConfigInstance.APIKey))
-	logger.Info(fmt.Sprintf("Proxy: %s", ConfigInstance.Proxy))
-	logger.Info(fmt.Sprintf("ChatDelete: %t", ConfigInstance.ChatDelete))
-	logger.Info(fmt.Sprintf("MaxChatHistoryLength: %d", ConfigInstance.MaxChatHistoryLength))
-	logger.Info(fmt.Sprintf("NoRolePrefix: %t", ConfigInstance.NoRolePrefix))
-	logger.Info(fmt.Sprintf("PromptDisableArtifacts: %t", ConfigInstance.PromptDisableArtifacts))
-	logger.Info(fmt.Sprintf("EnableMirrorApi: %t", ConfigInstance.EnableMirrorApi))
-	logger.Info(fmt.Sprintf("MirrorApiPrefix: %s", ConfigInstance.MirrorApiPrefix))
-	logger.Info(fmt.Sprintf("EnableGateway: %t", ConfigInstance.EnableGateway))
-	logger.Info(fmt.Sprintf("EnableTools: %t", ConfigInstance.EnableTools))
-	logger.Info(fmt.Sprintf("OnlyLastImage: %t", ConfigInstance.OnlyLastImage))
-	logger.Info(fmt.Sprintf("EnableMCP: %t", ConfigInstance.EnableMCP))
-	logger.Info(fmt.Sprintf("EnableGeolocation: %t", ConfigInstance.EnableGeolocation))
-	logger.Info(fmt.Sprintf("EnableGrove: %t", ConfigInstance.EnableGrove))
+	logger.Info("Address: %s", ConfigInstance.Address)
+	logger.Info("APIKey: %s", ConfigInstance.APIKey)
+	logger.Info("Proxy: %s", ConfigInstance.Proxy)
+	logger.Info("ChatDelete: %t", ConfigInstance.ChatDelete)
+	logger.Info("MaxChatHistoryLength: %d", ConfigInstance.MaxChatHistoryLength)
+	logger.Info("NoRolePrefix: %t", ConfigInstance.NoRolePrefix)
+	logger.Info("PromptDisableArtifacts: %t", ConfigInstance.PromptDisableArtifacts)
+	logger.Info("EnableMirrorApi: %t", ConfigInstance.EnableMirrorApi)
+	logger.Info("MirrorApiPrefix: %s", ConfigInstance.MirrorApiPrefix)
+	logger.Info("EnableGateway: %t", ConfigInstance.EnableGateway)
+	logger.Info("EnableTools: %t", ConfigInstance.EnableTools)
+	logger.Info("OnlyLastImage: %t", ConfigInstance.OnlyLastImage)
+	logger.Info("EnableMCP: %t", ConfigInstance.EnableMCP)
+	logger.Info("EnableGeolocation: %t", ConfigInstance.EnableGeolocation)
+	logger.Info("EnableGrove: %t", ConfigInstance.EnableGrove)
+	logger.Info("EnableMemory: %t", ConfigInstance.EnableMemory)
 }

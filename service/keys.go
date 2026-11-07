@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -47,11 +48,16 @@ var mcpOpMu sync.Mutex
 // overwrite each other's target values on the same accounts.
 var privacySyncMu sync.Mutex
 
+// memorySyncMu serializes memory syncs. It is separate from privacySyncMu
+// because the settings PATCH merges keys and a rejected memory key must not
+// make the privacy sync fail.
+var memorySyncMu sync.Mutex
+
 // envFileMu protects the read-modify-write in saveEnvLine from concurrent
 // dashboard toggles corrupting .env.
 var envFileMu sync.Mutex
 
-type privacySyncResult struct {
+type syncResult struct {
 	Account string `json:"account"`
 	Status  string `json:"status"`
 	Message string `json:"message"`
@@ -161,7 +167,7 @@ func KeyAddHandler(c *gin.Context) {
 		}
 	}
 	if err := persistCookieAccounts(); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist accounts: %v", err))
+		logger.Error("Failed to persist accounts: %v", err)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Added account " + displayLabel(&s),
@@ -187,7 +193,7 @@ func KeyDeleteHandler(c *gin.Context) {
 		return
 	}
 	if err := persistCookieAccounts(); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist accounts: %v", err))
+		logger.Error("Failed to persist accounts: %v", err)
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Account deleted"})
 }
@@ -224,7 +230,7 @@ func GatewayKeySetHandler(c *gin.Context) {
 	}
 	config.ConfigInstance.SetGatewayKey(key)
 	if err := saveEnvLine("GATEWAY_KEY", key); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist GATEWAY_KEY to .env: %v", err))
+		logger.Error("Failed to persist GATEWAY_KEY to .env: %v", err)
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Gateway key updated"})
 }
@@ -247,7 +253,7 @@ func ToolsSetHandler(c *gin.Context) {
 	config.ConfigInstance.EnableTools = body.Enabled
 	config.ConfigInstance.RwMutx.Unlock()
 	if err := saveEnvLine("ENABLE_TOOLS", fmt.Sprintf("%t", body.Enabled)); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist ENABLE_TOOLS to .env: %v", err))
+		logger.Error("Failed to persist ENABLE_TOOLS to .env: %v", err)
 	}
 	c.JSON(http.StatusOK, gin.H{"enableTools": body.Enabled})
 }
@@ -271,7 +277,7 @@ func MCPSetHandler(c *gin.Context) {
 	config.ConfigInstance.RwMutx.Unlock()
 	core.ClearMCPCache()
 	if err := saveEnvLine("ENABLE_MCP", fmt.Sprintf("%t", body.Enabled)); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist ENABLE_MCP to .env: %v", err))
+		logger.Error("Failed to persist ENABLE_MCP to .env: %v", err)
 	}
 	c.JSON(http.StatusOK, gin.H{"enableMCP": body.Enabled})
 }
@@ -306,10 +312,10 @@ func PrivacySyncHandler(c *gin.Context) {
 	config.ConfigInstance.EnableGrove = grove
 	config.ConfigInstance.RwMutx.Unlock()
 	if err := saveEnvLine("ENABLE_GEOLOCATION", fmt.Sprintf("%t", geolocation)); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist ENABLE_GEOLOCATION to .env: %v", err))
+		logger.Error("Failed to persist ENABLE_GEOLOCATION to .env: %v", err)
 	}
 	if err := saveEnvLine("ENABLE_GROVE", fmt.Sprintf("%t", grove)); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist ENABLE_GROVE to .env: %v", err))
+		logger.Error("Failed to persist ENABLE_GROVE to .env: %v", err)
 	}
 
 	config.ConfigInstance.RwMutx.RLock()
@@ -317,7 +323,7 @@ func PrivacySyncHandler(c *gin.Context) {
 	copy(sessionsCopy, config.ConfigInstance.Sessions)
 	config.ConfigInstance.RwMutx.RUnlock()
 
-	results := make([]privacySyncResult, len(sessionsCopy))
+	results := make([]syncResult, len(sessionsCopy))
 	if len(sessionsCopy) == 0 {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Không có tài khoản nào trong pool",
@@ -339,24 +345,24 @@ func PrivacySyncHandler(c *gin.Context) {
 			label := displayLabel(&sess)
 			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
 			if err := client.UpdatePrivacySettings(geolocation, grove); err != nil {
-				results[idx] = privacySyncResult{Account: label, Status: "error", Message: err.Error()}
-				logger.Warn(fmt.Sprintf("Privacy sync failed for account %s: %v", label, err))
+				results[idx] = syncResult{Account: label, Status: "error", Message: err.Error()}
+				logger.Warn("Privacy sync failed for account %s: %v", label, err)
 				return
 			}
 			gotGeo, gotGrove, err := client.GetAccountPrivacySettings()
 			if err != nil {
-				results[idx] = privacySyncResult{Account: label, Status: "warning", Message: "đã gửi nhưng không xác minh được: " + err.Error()}
-				logger.Warn(fmt.Sprintf("Privacy sync verification failed for account %s: %v", label, err))
+				results[idx] = syncResult{Account: label, Status: "warning", Message: "đã gửi nhưng không xác minh được: " + err.Error()}
+				logger.Warn("Privacy sync verification failed for account %s: %v", label, err)
 				return
 			}
 			msg, verified := privacyVerifyMessage(geolocation, grove, gotGeo, gotGrove)
 			if !verified {
-				results[idx] = privacySyncResult{Account: label, Status: "warning", Message: msg}
-				logger.Warn(fmt.Sprintf("Privacy sync warning for account %s: %s", label, msg))
+				results[idx] = syncResult{Account: label, Status: "warning", Message: msg}
+				logger.Warn("Privacy sync warning for account %s: %s", label, msg)
 				return
 			}
-			results[idx] = privacySyncResult{Account: label, Status: "ok", Message: msg}
-			logger.Info(fmt.Sprintf("Privacy sync succeeded for account %s: %s", label, msg))
+			results[idx] = syncResult{Account: label, Status: "ok", Message: msg}
+			logger.Info("Privacy sync succeeded for account %s: %s", label, msg)
 		}(i, s)
 	}
 	wg.Wait()
@@ -385,6 +391,117 @@ func privacyVerifyMessage(wantGeo, wantGrove bool, gotGeo, gotGrove *bool) (stri
 		return "đã gửi, chưa xác nhận: " + strings.Join(problems, "; "), false
 	}
 	return fmt.Sprintf("đã cập nhật (location=%t, improve_models=%t)", wantGeo, wantGrove), true
+}
+
+// MemoryGetHandler returns the target value used by the memory sync.
+func MemoryGetHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"memory": config.ConfigInstance.MemorySyncSettings()})
+}
+
+// MemorySyncHandler applies claude.ai's "Generate memory from chats" setting to
+// every account in the pool and records the target value in config and .env.
+func MemorySyncHandler(c *gin.Context) {
+	var body struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Enabled == nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"enabled\": true|false}"})
+		return
+	}
+	enabled := *body.Enabled
+
+	if !memorySyncMu.TryLock() {
+		c.JSON(http.StatusConflict, ErrorResponse{Error: "Đang có thao tác đồng bộ bộ nhớ khác chạy, vui lòng thử lại sau"})
+		return
+	}
+	defer memorySyncMu.Unlock()
+
+	config.ConfigInstance.RwMutx.Lock()
+	config.ConfigInstance.EnableMemory = enabled
+	config.ConfigInstance.RwMutx.Unlock()
+	if err := saveEnvLine("ENABLE_MEMORY", fmt.Sprintf("%t", enabled)); err != nil {
+		logger.Error("Failed to persist ENABLE_MEMORY to .env: %v", err)
+	}
+
+	config.ConfigInstance.RwMutx.RLock()
+	sessionsCopy := make([]config.SessionInfo, len(config.ConfigInstance.Sessions))
+	copy(sessionsCopy, config.ConfigInstance.Sessions)
+	config.ConfigInstance.RwMutx.RUnlock()
+
+	results := make([]syncResult, len(sessionsCopy))
+	if len(sessionsCopy) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Không có tài khoản nào trong pool",
+			"results": results,
+		})
+		return
+	}
+
+	var wg sync.WaitGroup
+	// Limit concurrency to 3 to avoid hitting Claude rate limits or TLS connection surges
+	sem := make(chan struct{}, 3)
+	for i, s := range sessionsCopy {
+		wg.Add(1)
+		go func(idx int, sess config.SessionInfo) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			label := displayLabel(&sess)
+			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
+			if err := client.UpdateMemorySettings(enabled); err != nil {
+				results[idx] = syncResult{Account: label, Status: "error", Message: err.Error()}
+				logger.Warn("Memory sync failed for account %s: %v", label, err)
+				return
+			}
+			got, err := client.GetAccountMemorySetting()
+			// claude.ai applies settings asynchronously, so retry briefly
+			// before reporting a warning.
+			for attempt := 0; err == nil && !memorySettingMatches(enabled, got) && attempt < 2; attempt++ {
+				time.Sleep(time.Second)
+				got, err = client.GetAccountMemorySetting()
+			}
+			if err != nil {
+				results[idx] = syncResult{Account: label, Status: "warning", Message: "đã gửi nhưng không xác minh được: " + err.Error()}
+				logger.Warn("Memory sync verification failed for account %s: %v", label, err)
+				return
+			}
+			msg, verified := memoryVerifyMessage(enabled, got)
+			if !verified {
+				results[idx] = syncResult{Account: label, Status: "warning", Message: msg}
+				logger.Warn("Memory sync warning for account %s: %s", label, msg)
+				return
+			}
+			results[idx] = syncResult{Account: label, Status: "ok", Message: msg}
+			logger.Info("Memory sync succeeded for account %s: %s", label, msg)
+		}(i, s)
+	}
+	wg.Wait()
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Đã hoàn thành đồng bộ bộ nhớ",
+		"results": results,
+	})
+}
+
+// memorySettingMatches reports whether the read-back value fulfils the target.
+// claude.ai stores a null enabled_saffron until the user picks a value and
+// treats null as enabled (the upstream default on Free/Pro/Max).
+func memorySettingMatches(want bool, got *bool) bool {
+	if got == nil {
+		return want
+	}
+	return *got == want
+}
+
+func memoryVerifyMessage(want bool, got *bool) (string, bool) {
+	if memorySettingMatches(want, got) {
+		return fmt.Sprintf("đã cập nhật (memory_from_chats=%t)", want), true
+	}
+	if got == nil {
+		return "đã gửi, chưa xác nhận: enabled_saffron còn null (mặc định bật; có thể chưa áp dụng hoặc bị admin tổ chức chặn)", false
+	}
+	return fmt.Sprintf("đã gửi, chưa xác nhận: enabled_saffron=%t", *got), false
 }
 
 // MCPSyncHandler synchronizes all accounts with a new remote MCP server URL.
@@ -465,11 +582,11 @@ func MCPSyncHandler(c *gin.Context) {
 					Status:  "error",
 					Message: syncErr.Error(),
 				}
-				logger.Warn(fmt.Sprintf("MCP sync failed for account %s: %v", label, syncErr))
+				logger.Warn("MCP sync failed for account %s: %v", label, syncErr)
 			} else {
 				res.Account = label
 				results[idx] = *res
-				logger.Info(fmt.Sprintf("MCP sync succeeded for account %s: %s", label, res.Message))
+				logger.Info("MCP sync succeeded for account %s: %s", label, res.Message)
 			}
 		}(i, s)
 	}
@@ -547,11 +664,11 @@ func MCPDeleteHandler(c *gin.Context) {
 					Status:  "error",
 					Message: delErr.Error(),
 				}
-				logger.Warn(fmt.Sprintf("MCP delete failed for account %s: %v", label, delErr))
+				logger.Warn("MCP delete failed for account %s: %v", label, delErr)
 			} else {
 				res.Account = label
 				results[idx] = *res
-				logger.Info(fmt.Sprintf("MCP delete for account %s: %s", label, res.Message))
+				logger.Info("MCP delete for account %s: %s", label, res.Message)
 			}
 		}(i, s)
 	}
@@ -583,7 +700,7 @@ func LastImageSetHandler(c *gin.Context) {
 	config.ConfigInstance.OnlyLastImage = body.Enabled
 	config.ConfigInstance.RwMutx.Unlock()
 	if err := saveEnvLine("ONLY_LAST_IMAGE", fmt.Sprintf("%t", body.Enabled)); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist ONLY_LAST_IMAGE to .env: %v", err))
+		logger.Error("Failed to persist ONLY_LAST_IMAGE to .env: %v", err)
 	}
 	c.JSON(http.StatusOK, gin.H{"onlyLastImage": body.Enabled})
 }
@@ -631,7 +748,7 @@ func KeyToggleHandler(c *gin.Context) {
 		return
 	}
 	if err := persistCookieAccounts(); err != nil {
-		logger.Error(fmt.Sprintf("Failed to persist accounts: %v", err))
+		logger.Error("Failed to persist accounts: %v", err)
 	}
 	state := "enabled"
 	if body.Disabled {
@@ -683,7 +800,7 @@ func resolveAccountEmail(s *config.SessionInfo) string {
 	client := core.NewClientWithCookie(s.SessionKey, config.ConfigInstance.Proxy, "", s.ExtraCookie, s.DeviceID)
 	email, err := client.GetAccountEmail()
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to resolve account email: %v", err))
+		logger.Error("Failed to resolve account email: %v", err)
 		return ""
 	}
 	return email

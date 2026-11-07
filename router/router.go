@@ -35,6 +35,8 @@ func SetupRoutes(r *gin.Engine) {
 		authedKeys.POST("/mcp/delete", service.MCPDeleteHandler)
 		authedKeys.GET("/privacy", service.PrivacyGetHandler)
 		authedKeys.POST("/privacy/sync", service.PrivacySyncHandler)
+		authedKeys.GET("/memory", service.MemoryGetHandler)
+		authedKeys.POST("/memory/sync", service.MemorySyncHandler)
 		authedKeys.GET("/last-image", service.LastImageGetHandler)
 		authedKeys.POST("/last-image", service.LastImageSetHandler)
 		authedKeys.POST("/check", service.KeyCheckHandler)

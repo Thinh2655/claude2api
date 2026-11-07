@@ -5,7 +5,6 @@ import (
 	"claude2api/config"
 	"claude2api/logger"
 	"encoding/json"
-	"fmt"
 	"strings"
 )
 
@@ -94,8 +93,8 @@ func (p *ChatRequestProcessor) ProcessMessages(messages []map[string]interface{}
 	}
 	p.RootPrompt.WriteString(p.Prompt.String())
 	// Debug output
-	logger.Debug(fmt.Sprintf("Processed prompt: %s", p.Prompt.String()))
-	logger.Debug(fmt.Sprintf("Image data list: %v", p.ImgDataList))
+	logger.Debug("Processed prompt: %s", p.Prompt.String())
+	logger.Debug("Image data list: %v", p.ImgDataList)
 }
 
 // ResetForBigContext resets the prompt for big context usage

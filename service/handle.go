@@ -110,7 +110,7 @@ func ChatCompletionsHandler(c *gin.Context) {
 	for _, index := range order {
 		session, err := config.ConfigInstance.GetSessionForModel(index)
 		if err != nil {
-			logger.Error(fmt.Sprintf("Failed to get session for model %s: %v", model, err))
+			logger.Error("Failed to get session for model %s: %v", model, err)
 			lastStatus = http.StatusServiceUnavailable
 			continue
 		}
@@ -119,7 +119,7 @@ func ChatCompletionsHandler(c *gin.Context) {
 		if label == "" {
 			label = maskKey(session.SessionKey)
 		}
-		logger.Info(fmt.Sprintf("Using account for model %s: %s", model, label))
+		logger.Info("Using account for model %s: %s", model, label)
 		// Initialize client and process request
 		st, ok, errMsg := handleChatRequest(c, session, model, processor, req.Stream)
 		if ok {
@@ -151,14 +151,14 @@ func ChatCompletionsHandler(c *gin.Context) {
 			ttl := core.ParseLimitReset(errMsg)
 			if ttl <= 0 {
 				ttl = config.DefaultLimitTTL
-				logger.Info(fmt.Sprintf("Limit message has no parseable reset time, fallback %s: %s", ttl, core.LimitReasonSnippet(errMsg)))
+				logger.Info("Limit message has no parseable reset time, fallback %s: %s", ttl, core.LimitReasonSnippet(errMsg))
 			}
 			reason := core.LimitReasonSnippet(errMsg)
 			if reason == "" {
 				reason = http.StatusText(st)
 			}
 			until := config.LockLimitSession(session.SessionKey, reason, ttl)
-			logger.Info(fmt.Sprintf("Account %s hit usage limit, locked until %s (%s)", label, until.Format("15:04:05"), reason))
+			logger.Info("Account %s hit usage limit, locked until %s (%s)", label, until.Format("15:04:05"), reason)
 		} else if st == http.StatusBadGateway && strings.Contains(errMsg, "MCP tool requires manual approval") {
 			// Do not lock or cooldown account for MCP approval wait; stop retry loop and fail immediately
 			logger.Warn("Request stopped: MCP tool requires approval on claude.ai")
@@ -408,8 +408,8 @@ func formatWait(d time.Duration) string {
 
 func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string, processor *utils.ChatRequestProcessor, stream bool) (status int, ok bool, errMsg string) {
 	start := time.Now()
-	session.Lock()
-	defer session.Unlock()
+	session.LockSession()
+	defer session.UnlockSession()
 
 	// Capture the real user prompt for the dashboard before the big-context path
 	// below overwrites processor.Prompt with the "immerse yourself" instruction.
@@ -455,7 +455,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	if session.OrgID == "" {
 		orgId, err := claudeClient.GetOrgID()
 		if err != nil {
-			logger.Error(fmt.Sprintf("Failed to get org ID: %v", err))
+			logger.Error("Failed to get org ID: %v", err)
 			return fail(http.StatusServiceUnavailable, err.Error())
 		}
 		session.OrgID = orgId
@@ -470,7 +470,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	if len(processor.ImgDataList) > 0 {
 		err := claudeClient.UploadFile(processor.ImgDataList)
 		if err != nil {
-			logger.Error(fmt.Sprintf("Failed to upload file: %v", err))
+			logger.Error("Failed to upload file: %v", err)
 			return fail(http.StatusServiceUnavailable, err.Error())
 		}
 	}
@@ -479,7 +479,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	if processor.Prompt.Len() > config.ConfigInstance.MaxChatHistoryLength {
 		claudeClient.SetBigContext(processor.Prompt.String())
 		processor.ResetForBigContext()
-		logger.Info(fmt.Sprintf("Prompt length exceeds max limit (%d), using file context", config.ConfigInstance.MaxChatHistoryLength))
+		logger.Info("Prompt length exceeds max limit (%d), using file context", config.ConfigInstance.MaxChatHistoryLength)
 	}
 
 	// Single-request flow: create_conversation_params embedded in completion,
@@ -488,7 +488,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	// cleanup must use (a guessed ID would delete nothing).
 	conversationID, statusCode, err := claudeClient.SendMessageWithCreate(processor.Prompt.String(), stream, c)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to send message: %v", err))
+		logger.Error("Failed to send message: %v", err)
 		if errors.Is(err, core.ErrMCPApproval) {
 			return fail(http.StatusBadGateway, "MCP tool requires manual approval on claude.ai UI. Please connect the tool in claude.ai or disable EnableMCP.")
 		}
@@ -509,13 +509,13 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 func cleanupConversation(client *core.Client, conversationID string, retry int) {
 	for i := 0; i < retry; i++ {
 		if err := client.DeleteConversation(conversationID); err != nil {
-			logger.Error(fmt.Sprintf("Failed to delete conversation: %v", err))
+			logger.Error("Failed to delete conversation: %v", err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		logger.Info(fmt.Sprintf("Successfully deleted conversation: %s", conversationID))
+		logger.Info("Successfully deleted conversation: %s", conversationID)
 		return // 成功后直接返回，不执行后面的错误日志
 	}
 	// 只有当所有重试都失败后，才会执行到这里
-	logger.Error(fmt.Sprintf("Cleanup %s conversation %s failed after %d retries", client.SessionKey, conversationID, retry))
+	logger.Error("Cleanup %s conversation %s failed after %d retries", client.SessionKey, conversationID, retry)
 }

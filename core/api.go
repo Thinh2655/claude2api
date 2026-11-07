@@ -356,11 +356,11 @@ func FetchBootstrapModels(sessionKey, cookie, deviceID string) []BootstrapModel 
 		SetHeader("accept", "application/json").
 		Get("https://claude.ai/api/bootstrap")
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to fetch bootstrap model list: %v", err))
+		logger.Error("Failed to fetch bootstrap model list: %v", err)
 		return nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		logger.Error(fmt.Sprintf("Bootstrap fetch returned %d", resp.StatusCode))
+		logger.Error("Bootstrap fetch returned %d", resp.StatusCode)
 		return nil
 	}
 
@@ -374,7 +374,7 @@ func FetchBootstrapModels(sessionKey, cookie, deviceID string) []BootstrapModel 
 		} `json:"account"`
 	}
 	if err := json.Unmarshal(resp.Bytes(), &boot); err != nil {
-		logger.Error(fmt.Sprintf("Failed to parse bootstrap response: %v", err))
+		logger.Error("Failed to parse bootstrap response: %v", err)
 		return nil
 	}
 	var out []BootstrapModel
@@ -386,7 +386,7 @@ func FetchBootstrapModels(sessionKey, cookie, deviceID string) []BootstrapModel 
 	}
 	bootstrapModels = out
 	bootstrapModelsAt = time.Now()
-	logger.Info(fmt.Sprintf("Fetched %d models from claude.ai", len(out)))
+	logger.Info("Fetched %d models from claude.ai", len(out))
 	return out
 }
 
@@ -723,7 +723,7 @@ func (c *Client) CreateConversation() (string, error) {
 		paprikaVal = paprikaMode
 	}
 	if err := c.UpdateUserSetting("paprika_mode", paprikaVal); err != nil {
-		logger.Error(fmt.Sprintf("Failed to update paprika_mode: %v", err))
+		logger.Error("Failed to update paprika_mode: %v", err)
 	}
 	requestBody := map[string]interface{}{
 		"model":                            c.model,
@@ -747,7 +747,7 @@ func (c *Client) CreateConversation() (string, error) {
 	if err := json.Unmarshal(resp.Bytes(), &result); err != nil {
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
-	logger.Info(fmt.Sprintf("create conversation response: %s", resp.String()))
+	logger.Info("create conversation response: %s", resp.String())
 	uuid, ok := result["uuid"].(string)
 	if !ok {
 		return "", errors.New("conversation UUID not found in response")
@@ -805,7 +805,7 @@ func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Cont
 	if err != nil {
 		return "", 500, fmt.Errorf("request failed: %w", err)
 	}
-	logger.Info(fmt.Sprintf("Claude response status code: %d", resp.StatusCode))
+	logger.Info("Claude response status code: %d", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		bodySnippet := readErrorSnippet(resp)
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -874,7 +874,7 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 	if err != nil {
 		return 500, fmt.Errorf("request failed: %w", err)
 	}
-	logger.Info(fmt.Sprintf("Claude response status code: %d", resp.StatusCode))
+	logger.Info("Claude response status code: %d", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		bodySnippet := readErrorSnippet(resp)
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -965,7 +965,7 @@ scan:
 		select {
 		case <-clientDone:
 			// 客户端已断开连接，清理资源并退出
-			logger.Warn(fmt.Sprintf("Client closed connection mid-stream (%d bytes text, %d bytes reasoning), event types: %v", len(res_all_text), len(res_reasoning_text), seenTypes))
+			logger.Warn("Client closed connection mid-stream (%d bytes text, %d bytes reasoning), event types: %v", len(res_all_text), len(res_reasoning_text), seenTypes)
 			return nil
 		default:
 			// 继续处理响应
@@ -1003,7 +1003,7 @@ scan:
 				// which causes upstream to pause and hang indefinitely.
 				if event.ContentBlock.Type == "tool_use" && len(event.ContentBlock.ApprovalOptions) > 0 {
 					approvalTool = event.ContentBlock.Name
-					logger.Warn(fmt.Sprintf("MCP tool %q requires manual approval on claude.ai, aborting to prevent hang", approvalTool))
+					logger.Warn("MCP tool %q requires manual approval on claude.ai, aborting to prevent hang", approvalTool)
 					approvalAbort.Store(true)
 					body.Close()
 					break scan
@@ -1188,7 +1188,7 @@ scan:
 	// Nothing parsed out of the stream: log the event types seen so an empty
 	// response (Out ↓ = 0) can be diagnosed without re-enabling the SSE dump.
 	if res_all_text == "" && res_reasoning_text == "" {
-		logger.Warn(fmt.Sprintf("Upstream sent no usable content (stream=%t), event types: %v", stream, seenTypes))
+		logger.Warn("Upstream sent no usable content (stream=%t), event types: %v", stream, seenTypes)
 	}
 	if !stream {
 		model.ResponseWithTools(res_all_text, res_reasoning_text, stream, gc)
@@ -1363,6 +1363,7 @@ var allowedUserSettings = map[string]bool{
 	"enabled_foccacia":                 true,
 	"dismissed_claude_code_spotlight":  true,
 	"enabled_geolocation":              true,
+	"enabled_saffron":                  true,
 	"grove_enabled":                    true,
 	"enabled_mcp_tools":                true,
 	"paprika_mode":                     true,
@@ -1387,35 +1388,64 @@ func (c *Client) UpdatePrivacySettings(enabledGeolocation, groveEnabled bool) er
 	})
 }
 
-// accountPrivacySettings is the subset of /api/account.settings needed to
-// verify a privacy sync. Pointers preserve null: claude.ai treats a null
-// enabled_geolocation as enabled, while a null grove_enabled means the account
-// has not accepted the current privacy terms yet.
-type accountPrivacySettings struct {
-	EnabledGeolocation *bool `json:"enabled_geolocation"`
-	GroveEnabled       *bool `json:"grove_enabled"`
+// UpdateMemorySettings turns claude.ai's "Generate memory from chats" setting
+// on or off. The upstream key is the internal codename enabled_saffron.
+func (c *Client) UpdateMemorySettings(enabled bool) error {
+	return c.updateUserSettings(map[string]interface{}{
+		"enabled_saffron": enabled,
+	})
 }
 
-// GetAccountPrivacySettings reads back the privacy settings so the sync
-// handler can report warnings when a 202 response did not actually apply.
-func (c *Client) GetAccountPrivacySettings() (*bool, *bool, error) {
+// accountSettings is the subset of /api/account.settings needed to verify a
+// sync. Pointers preserve null: claude.ai treats a null enabled_geolocation as
+// enabled, a null grove_enabled means the account has not accepted the current
+// privacy terms yet, and a null enabled_saffron means the upstream default
+// (enabled on Free/Pro/Max) still applies.
+type accountSettings struct {
+	EnabledGeolocation *bool `json:"enabled_geolocation"`
+	GroveEnabled       *bool `json:"grove_enabled"`
+	EnabledSaffron     *bool `json:"enabled_saffron"`
+}
+
+// fetchAccountSettings reads /api/account once so sync handlers can verify
+// that a PATCH actually applied.
+func (c *Client) fetchAccountSettings() (*accountSettings, error) {
 	resp, err := c.client.R().
 		SetHeader("referer", "https://claude.ai/").
 		SetHeader("accept", "application/json").
 		Get("https://claude.ai/api/account")
 	if err != nil {
-		return nil, nil, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 	var acct struct {
-		Settings accountPrivacySettings `json:"settings"`
+		Settings accountSettings `json:"settings"`
 	}
 	if err := json.Unmarshal(resp.Bytes(), &acct); err != nil {
-		return nil, nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-	return acct.Settings.EnabledGeolocation, acct.Settings.GroveEnabled, nil
+	return &acct.Settings, nil
+}
+
+// GetAccountPrivacySettings reads back the privacy settings so the sync
+// handler can report warnings when a 202 response did not actually apply.
+func (c *Client) GetAccountPrivacySettings() (*bool, *bool, error) {
+	settings, err := c.fetchAccountSettings()
+	if err != nil {
+		return nil, nil, err
+	}
+	return settings.EnabledGeolocation, settings.GroveEnabled, nil
+}
+
+// GetAccountMemorySetting reads back the memory toggle for sync verification.
+func (c *Client) GetAccountMemorySetting() (*bool, error) {
+	settings, err := c.fetchAccountSettings()
+	if err != nil {
+		return nil, err
+	}
+	return settings.EnabledSaffron, nil
 }
 
 func (c *Client) updateUserSettings(settings map[string]interface{}) error {
@@ -1427,13 +1457,13 @@ func (c *Client) updateUserSettings(settings map[string]interface{}) error {
 	if len(settings) == 1 {
 		for key, value := range settings {
 			if m, ok := value.(map[string]interface{}); ok {
-				logger.Info(fmt.Sprintf("Updating setting %s (%d entries)", key, len(m)))
+				logger.Info("Updating setting %s (%d entries)", key, len(m))
 			} else {
-				logger.Info(fmt.Sprintf("Updating setting %s to %v", key, value))
+				logger.Info("Updating setting %s to %v", key, value)
 			}
 		}
 	} else {
-		logger.Info(fmt.Sprintf("Updating %d account settings", len(settings)))
+		logger.Info("Updating %d account settings", len(settings))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

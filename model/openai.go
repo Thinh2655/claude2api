@@ -4,7 +4,6 @@ import (
 	"claude2api/logger"
 	"claude2api/utils"
 	"encoding/json"
-	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -125,7 +124,7 @@ func streamReasoningResponse(reasoning string, gc *gin.Context) error {
 
 	jsonBytes, err := json.Marshal(openAIResp)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Error marshalling JSON: %v", err))
+		logger.Error("Error marshalling JSON: %v", err)
 		return err
 	}
 	jsonBytes = append([]byte("data: "), jsonBytes...)
@@ -166,7 +165,7 @@ func streamRespose(text string, gc *gin.Context) error {
 	jsonBytes = append([]byte("data: "), jsonBytes...)
 	jsonBytes = append(jsonBytes, []byte("\n\n")...)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Error marshalling JSON: %v", err))
+		logger.Error("Error marshalling JSON: %v", err)
 		return err
 	}
 
@@ -289,7 +288,7 @@ func streamToolResponse(text string, calls []ToolCall, gc *gin.Context) error {
 	jsonBytes = append([]byte("data: "), jsonBytes...)
 	jsonBytes = append(jsonBytes, []byte("\n\n")...)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Error marshalling JSON: %v", err))
+		logger.Error("Error marshalling JSON: %v", err)
 		return err
 	}
 

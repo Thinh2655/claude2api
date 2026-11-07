@@ -166,7 +166,7 @@ func (c *Client) getOrFetchMCPTools(orgID string) []map[string]interface{} {
 	tools, err := c.fetchRemoteMCPTools(orgID)
 	ttl := 15 * time.Minute
 	if err != nil {
-		logger.Warn(fmt.Sprintf("Failed to fetch MCP tools for org %s: %v", orgID, err))
+		logger.Warn("Failed to fetch MCP tools for org %s: %v", orgID, err)
 		// If we had stale tools, keep using them on error
 		if exists && len(entry.tools) > 0 {
 			ttl = 2 * time.Minute
@@ -237,13 +237,13 @@ func (c *Client) fetchRemoteMCPTools(orgID string) ([]map[string]interface{}, er
 				SetHeader("referer", "https://claude.ai/chat").
 				Get(toolsURL)
 			if tErr != nil || tResp.StatusCode != http.StatusOK {
-				logger.Warn(fmt.Sprintf("Failed to fetch tools for MCP server %s (%s): %v", s.Name, s.UUID, tErr))
+				logger.Warn("Failed to fetch tools for MCP server %s (%s): %v", s.Name, s.UUID, tErr)
 				return
 			}
 
 			var toolsData remoteMCPToolsResponse
 			if err := json.Unmarshal(tResp.Bytes(), &toolsData); err != nil {
-				logger.Warn(fmt.Sprintf("Failed to unmarshal tools for MCP server %s: %v", s.Name, err))
+				logger.Warn("Failed to unmarshal tools for MCP server %s: %v", s.Name, err)
 				return
 			}
 
@@ -279,7 +279,7 @@ func (c *Client) fetchRemoteMCPTools(orgID string) ([]map[string]interface{}, er
 	}
 
 	wg.Wait()
-	logger.Info(fmt.Sprintf("Fetched %d MCP tools for org %s", len(results), orgID))
+	logger.Info("Fetched %d MCP tools for org %s", len(results), orgID)
 	return results, nil
 }
 
@@ -586,7 +586,7 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 			}
 			newServer = s
 			reused = true
-			logger.Info(fmt.Sprintf("Found existing connector %s matching URL %s", s.UUID, mcpURL))
+			logger.Info("Found existing connector %s matching URL %s", s.UUID, mcpURL)
 			if s.Name != mcpName {
 				if err := c.renameRemoteServer(orgID, s.UUID, mcpName); err != nil {
 					renameWarn = fmt.Sprintf("không đổi được tên connector cũ: %v", err)
@@ -631,7 +631,7 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 			}
 			deletedCount++
 			deletedUUIDs[existingUUID] = true
-			logger.Info(fmt.Sprintf("409 Conflict: deleted connector %s, retrying create for URL %s", existingUUID, mcpURL))
+			logger.Info("409 Conflict: deleted connector %s, retrying create for URL %s", existingUUID, mcpURL)
 			time.Sleep(500 * time.Millisecond)
 			status, body, err = c.postRemoteMCPServer(serversURL, createBody)
 			if err != nil {
@@ -703,7 +703,7 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 			continue
 		}
 		if err := c.deleteRemoteServer(orgID, old.UUID); err != nil {
-			logger.Warn(fmt.Sprintf("Failed to delete old MCP server %s: %v", old.UUID, err))
+			logger.Warn("Failed to delete old MCP server %s: %v", old.UUID, err)
 			continue
 		}
 		deletedCount++
@@ -715,7 +715,7 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 	// call does not pause for manual approval mid-stream.
 	enabledMap, settingsErr := c.fetchEnabledMCPTools()
 	if settingsErr != nil {
-		logger.Warn(fmt.Sprintf("Failed to read enabled_mcp_tools for org %s: %v", orgID, settingsErr))
+		logger.Warn("Failed to read enabled_mcp_tools for org %s: %v", orgID, settingsErr)
 	} else {
 		// Drop keys of deleted servers and stale keys of the reused server:
 		// the always-allow hash can change when a tool definition changes.
@@ -754,7 +754,7 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 	if settingErr == nil && len(toolsResp.Tools) > 0 {
 		if err := c.UpdateUserSetting("enabled_mcp_tools", enabledMap); err != nil {
 			settingErr = fmt.Errorf("write setting: %w", err)
-			logger.Warn(fmt.Sprintf("Failed to set always-allow for org %s: %v", orgID, err))
+			logger.Warn("Failed to set always-allow for org %s: %v", orgID, err)
 		} else {
 			// PATCH returns 202 (accepted), so allow the read-back a moment to
 			// catch up before reporting a failure.
@@ -766,7 +766,7 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 				saved, err := c.fetchEnabledMCPTools()
 				if err != nil {
 					settingErr = fmt.Errorf("verify setting: %w", err)
-					logger.Warn(fmt.Sprintf("Failed to verify always-allow for org %s: %v", orgID, err))
+					logger.Warn("Failed to verify always-allow for org %s: %v", orgID, err)
 					continue
 				}
 				settingErr = nil
@@ -783,7 +783,7 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 			}
 			if settingErr == nil && missingKey != "" {
 				settingErr = fmt.Errorf("setting %q was not persisted", missingKey)
-				logger.Warn(fmt.Sprintf("Always Allow key %q missing after sync for org %s", missingKey, orgID))
+				logger.Warn("Always Allow key %q missing after sync for org %s", missingKey, orgID)
 			}
 		}
 	}
@@ -1082,7 +1082,7 @@ func (c *Client) DeleteAllRemoteMCP() (*SyncMCPResult, error) {
 		}
 		if err := c.deleteRemoteServer(orgID, s.UUID); err != nil {
 			failed++
-			logger.Warn(fmt.Sprintf("Failed to delete MCP server %s (%s): %v", s.Name, s.UUID, err))
+			logger.Warn("Failed to delete MCP server %s (%s): %v", s.Name, s.UUID, err)
 			continue
 		}
 		deleted[s.UUID] = true
@@ -1092,7 +1092,7 @@ func (c *Client) DeleteAllRemoteMCP() (*SyncMCPResult, error) {
 	if len(deleted) > 0 {
 		if err := c.pruneEnabledMCPTools(deleted); err != nil {
 			settingWarn = true
-			logger.Warn(fmt.Sprintf("Failed to prune enabled_mcp_tools for org %s: %v", orgID, err))
+			logger.Warn("Failed to prune enabled_mcp_tools for org %s: %v", orgID, err)
 		}
 	}
 
@@ -1102,7 +1102,7 @@ func (c *Client) DeleteAllRemoteMCP() (*SyncMCPResult, error) {
 	verified := true
 	if after, listErr := c.listRemoteServers(orgID); listErr != nil {
 		verified = false
-		logger.Warn(fmt.Sprintf("Failed to verify remaining MCP servers for org %s: %v", orgID, listErr))
+		logger.Warn("Failed to verify remaining MCP servers for org %s: %v", orgID, listErr)
 	} else {
 		for _, s := range after {
 			if s.UUID != "" {
