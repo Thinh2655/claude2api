@@ -268,6 +268,10 @@ var modelThinkingSpecs = []struct {
 	ID   string
 	Spec ModelThinkingSpec
 }{
+	{"claude-sonnet-5-5", ModelThinkingSpec{
+		DefaultEffort: "high", Mode: "auto", Type: "effort_and_mode",
+		Efforts: []string{"low", "medium", "high", "xhigh", "max"},
+	}},
 	{"claude-sonnet-5", ModelThinkingSpec{
 		DefaultEffort: "high", Mode: "auto", Type: "effort_and_mode",
 		Efforts: []string{"low", "medium", "high"},
@@ -482,6 +486,9 @@ func ResolveThinking(model string) (baseModel, effort, thinkingMode, paprikaMode
 		}
 		if strings.HasPrefix(rest, m.ID+"-") {
 			tail := strings.TrimPrefix(rest, m.ID+"-")
+			if tail == "extra" {
+				tail = "xhigh"
+			}
 			if knownEfforts(m.Spec)[tail] {
 				base, spec, eff, ok = m.ID, m.Spec, tail, true
 				break
