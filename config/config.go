@@ -88,6 +88,11 @@ type Config struct {
 	// one, so long histories don't re-upload old images on each request.
 	OnlyLastImage bool `yaml:"onlyLastImage"`
 	EnableMCP     bool `yaml:"enableMCP"`
+	// MCPToolMode is the default permission an MCP sync gives every tool:
+	// "always_allow" (default) or "use_tool" (see MCPModeUseTool).
+	MCPToolMode string `yaml:"mcpToolMode"`
+	// MCPToolModes overrides MCPToolMode for single tools, keyed by tool name.
+	MCPToolModes map[string]string `yaml:"mcpToolModes"`
 	// EnableGeolocation, EnableGrove and EnableMemory are the target claude.ai
 	// settings applied by the dashboard's "sync all accounts" actions. They are
 	// not used at request time; they only record what the next sync should set
@@ -150,6 +155,158 @@ func (c *Config) MCPEnabled() bool {
 	c.RwMutx.RLock()
 	defer c.RwMutx.RUnlock()
 	return c.EnableMCP
+}
+
+// MCP tool permission modes. They map onto claude.ai's enabled_mcp_tools keys:
+// MCPModeAlwaysAllow sets both the "enabled" key and the "always approved" key
+// of a tool, so it runs without asking. MCPModeUseTool only sets the "enabled"
+// key, so claude.ai asks for approval each time the model calls the tool.
+const (
+	MCPModeAlwaysAllow = "always_allow"
+	MCPModeUseTool     = "use_tool"
+)
+
+// NormalizeMCPToolMode trims and lower-cases a permission mode and reports
+// whether it is one of the supported modes.
+func NormalizeMCPToolMode(mode string) (string, bool) {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case MCPModeAlwaysAllow, MCPModeUseTool:
+		return m, true
+	}
+	return "", false
+}
+
+func normalizeMCPToolEntry(name, mode string) (string, string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", "", fmt.Errorf("tên tool không được để trống")
+	}
+	if len(name) > 128 {
+		return "", "", fmt.Errorf("tên tool quá dài (tối đa 128 ký tự)")
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return "", "", fmt.Errorf("tên tool chứa ký tự điều khiển")
+		}
+	}
+	m, ok := NormalizeMCPToolMode(mode)
+	if !ok {
+		return "", "", fmt.Errorf("chế độ quyền của tool %q không hợp lệ: %q (dùng always_allow hoặc use_tool)", name, mode)
+	}
+	return name, m, nil
+}
+
+// ValidateMCPToolModes returns a normalized copy of per-tool permission modes,
+// or the first validation error.
+func ValidateMCPToolModes(in map[string]string) (map[string]string, error) {
+	out := make(map[string]string, len(in))
+	for name, mode := range in {
+		n, m, err := normalizeMCPToolEntry(name, mode)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := out[n]; dup {
+			return nil, fmt.Errorf("tên tool bị trùng: %q", n)
+		}
+		out[n] = m
+	}
+	return out, nil
+}
+
+// ParseMCPToolModes reads the MCP_TOOL_MODES value, a JSON object of
+// tool name -> mode. Invalid JSON or invalid entries are skipped with a warning.
+func ParseMCPToolModes(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var in map[string]string
+	if err := json.Unmarshal([]byte(raw), &in); err != nil {
+		logger.Warn("Ignoring MCP_TOOL_MODES, invalid JSON: %v", err)
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for name, mode := range in {
+		n, m, err := normalizeMCPToolEntry(name, mode)
+		if err != nil {
+			logger.Warn("Ignoring MCP_TOOL_MODES entry: %v", err)
+			continue
+		}
+		out[n] = m
+	}
+	return out
+}
+
+// EncodeMCPToolModes serializes per-tool modes for MCP_TOOL_MODES. Single
+// quotes are escaped so the value can be wrapped in single quotes in .env
+// (godotenv keeps single-quoted values literal).
+func EncodeMCPToolModes(modes map[string]string) string {
+	if len(modes) == 0 {
+		return "{}"
+	}
+	data, err := json.Marshal(modes)
+	if err != nil {
+		return "{}"
+	}
+	return strings.ReplaceAll(string(data), "'", `\u0027`)
+}
+
+// sanitizeMCPToolPermissions makes the loaded MCP permission settings valid:
+// an unknown default mode falls back to always_allow and invalid per-tool
+// entries are dropped.
+func (c *Config) sanitizeMCPToolPermissions() {
+	if m, ok := NormalizeMCPToolMode(c.MCPToolMode); ok {
+		c.MCPToolMode = m
+	} else {
+		if strings.TrimSpace(c.MCPToolMode) != "" {
+			logger.Warn("Invalid MCP tool mode %q, using %s", c.MCPToolMode, MCPModeAlwaysAllow)
+		}
+		c.MCPToolMode = MCPModeAlwaysAllow
+	}
+	if len(c.MCPToolModes) == 0 {
+		c.MCPToolModes = nil
+		return
+	}
+	clean := make(map[string]string, len(c.MCPToolModes))
+	for name, mode := range c.MCPToolModes {
+		n, m, err := normalizeMCPToolEntry(name, mode)
+		if err != nil {
+			logger.Warn("Ignoring mcpToolModes entry: %v", err)
+			continue
+		}
+		clean[n] = m
+	}
+	c.MCPToolModes = clean
+}
+
+// MCPToolPermissions returns the default MCP tool mode and a copy of the
+// per-tool overrides (safe under the config lock).
+func (c *Config) MCPToolPermissions() (string, map[string]string) {
+	c.RwMutx.RLock()
+	defer c.RwMutx.RUnlock()
+	mode, ok := NormalizeMCPToolMode(c.MCPToolMode)
+	if !ok {
+		mode = MCPModeAlwaysAllow
+	}
+	modes := make(map[string]string, len(c.MCPToolModes))
+	for k, v := range c.MCPToolModes {
+		modes[k] = v
+	}
+	return mode, modes
+}
+
+// SetMCPToolPermissions stores the default MCP tool mode and the per-tool
+// overrides. Callers pass values already checked by NormalizeMCPToolMode and
+// ValidateMCPToolModes.
+func (c *Config) SetMCPToolPermissions(mode string, modes map[string]string) {
+	c.RwMutx.Lock()
+	defer c.RwMutx.Unlock()
+	c.MCPToolMode = mode
+	c.MCPToolModes = make(map[string]string, len(modes))
+	for k, v := range modes {
+		c.MCPToolModes[k] = v
+	}
 }
 
 // PrivacySyncSettings returns the target values for the two claude.ai privacy
@@ -462,11 +619,12 @@ func loadConfigFromYAML(configPath string) (*Config, error) {
 
 	// Seed defaults before unmarshalling so a missing key keeps the intended
 	// default instead of the bool zero value.
-	config := Config{EnableGeolocation: true, EnableMemory: true}
+	config := Config{EnableGeolocation: true, EnableMemory: true, MCPToolMode: MCPModeAlwaysAllow}
 	err = yaml.Unmarshal(data, &config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %v", err)
 	}
+	config.sanitizeMCPToolPermissions()
 
 	// 设置读写锁（不从YAML加载）
 	config.RwMutx = sync.RWMutex{}
@@ -628,6 +786,10 @@ func loadConfigFromEnv() *Config {
 		OnlyLastImage: os.Getenv("ONLY_LAST_IMAGE") == "true",
 		// Hỗ trợ MCP tools
 		EnableMCP: os.Getenv("ENABLE_MCP") == "true",
+		// Quyền mặc định của tool MCP khi đồng bộ (always_allow | use_tool) và
+		// quyền riêng từng tool (JSON: {"tên_tool":"use_tool"}).
+		MCPToolMode:  os.Getenv("MCP_TOOL_MODE"),
+		MCPToolModes: ParseMCPToolModes(os.Getenv("MCP_TOOL_MODES")),
 		// Giá trị đích khi đồng bộ privacy: location metadata mặc định bật
 		// (claude.ai coi null là bật), model improvement mặc định tắt.
 		EnableGeolocation: os.Getenv("ENABLE_GEOLOCATION") != "false",
@@ -647,6 +809,7 @@ func loadConfigFromEnv() *Config {
 	if config.Address == "" {
 		config.Address = "0.0.0.0:8080"
 	}
+	config.sanitizeMCPToolPermissions()
 	return config
 }
 
@@ -698,6 +861,7 @@ func init() {
 	logger.Info("EnableTools: %t", ConfigInstance.EnableTools)
 	logger.Info("OnlyLastImage: %t", ConfigInstance.OnlyLastImage)
 	logger.Info("EnableMCP: %t", ConfigInstance.EnableMCP)
+	logger.Info("MCPToolMode: %s (overrides: %d)", ConfigInstance.MCPToolMode, len(ConfigInstance.MCPToolModes))
 	logger.Info("EnableGeolocation: %t", ConfigInstance.EnableGeolocation)
 	logger.Info("EnableGrove: %t", ConfigInstance.EnableGrove)
 	logger.Info("EnableMemory: %t", ConfigInstance.EnableMemory)

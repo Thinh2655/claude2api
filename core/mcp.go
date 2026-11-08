@@ -545,8 +545,8 @@ func mcpServerMatchesDefaultInstall(server remoteMCPServer, install *MCPInstall)
 }
 
 // SyncRemoteMCP replaces existing custom remote MCP servers on the account with the new MCP URL and name,
-// then marks all its tools as always allowed (enabled_mcp_tools).
-func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*SyncMCPResult, error) {
+// then applies the tool permissions (enabled_mcp_tools) from perms: Always Allow or "use tool" per tool.
+func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall, perms MCPToolPermissions) (*SyncMCPResult, error) {
 	orgID, err := c.GetOrgID()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get organization: %w", err)
@@ -709,10 +709,12 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 		deletedCount++
 	}
 
-	// 5. Update enabled_mcp_tools setting (Always Allow).
+	// 5. Update the enabled_mcp_tools setting (tool permissions).
 	// claude.ai stores two keys per tool: "<uuid>:<tool>" (tool enabled) and
-	// "<uuid>:<tool>-<hash>" (Always Allow). Both must be true so the upstream
-	// call does not pause for manual approval mid-stream.
+	// "<uuid>:<tool>-<hash>" (Always Allow). Always Allow tools get both keys
+	// set to true so the upstream call does not pause for manual approval
+	// mid-stream; "use_tool" tools only get the first key, so claude.ai asks
+	// for approval on each call.
 	enabledMap, settingsErr := c.fetchEnabledMCPTools()
 	if settingsErr != nil {
 		logger.Warn("Failed to read enabled_mcp_tools for org %s: %v", orgID, settingsErr)
@@ -729,62 +731,17 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 		}
 	}
 
-	missingAlways := 0
-	alwaysKeys := make([]string, 0, len(toolsResp.Tools))
+	var modeRes mcpModeResult
 	if settingsErr == nil {
-		for _, tool := range toolsResp.Tools {
-			if tool.Name == "" {
-				continue
-			}
-			enabledKey := tool.EnabledKey
-			if enabledKey == "" {
-				enabledKey = fmt.Sprintf("%s:%s", newServer.UUID, tool.Name)
-			}
-			enabledMap[enabledKey] = true
-			if tool.AlwaysApprovedKey == "" {
-				missingAlways++
-				continue
-			}
-			enabledMap[tool.AlwaysApprovedKey] = true
-			alwaysKeys = append(alwaysKeys, tool.AlwaysApprovedKey)
-		}
+		modeRes = applyMCPToolModes(enabledMap, newServer.UUID, toolsResp.Tools, perms)
 	}
+	missingAlways := modeRes.MissingKey
 
 	settingErr := settingsErr
 	if settingErr == nil && len(toolsResp.Tools) > 0 {
-		if err := c.UpdateUserSetting("enabled_mcp_tools", enabledMap); err != nil {
-			settingErr = fmt.Errorf("write setting: %w", err)
-			logger.Warn("Failed to set always-allow for org %s: %v", orgID, err)
-		} else {
-			// PATCH returns 202 (accepted), so allow the read-back a moment to
-			// catch up before reporting a failure.
-			missingKey := ""
-			for attempt := 0; attempt < 3; attempt++ {
-				if attempt > 0 {
-					time.Sleep(500 * time.Millisecond)
-				}
-				saved, err := c.fetchEnabledMCPTools()
-				if err != nil {
-					settingErr = fmt.Errorf("verify setting: %w", err)
-					logger.Warn("Failed to verify always-allow for org %s: %v", orgID, err)
-					continue
-				}
-				settingErr = nil
-				missingKey = ""
-				for _, key := range alwaysKeys {
-					if v, ok := saved[key]; !ok || v != true {
-						missingKey = key
-						break
-					}
-				}
-				if missingKey == "" {
-					break
-				}
-			}
-			if settingErr == nil && missingKey != "" {
-				settingErr = fmt.Errorf("setting %q was not persisted", missingKey)
-				logger.Warn("Always Allow key %q missing after sync for org %s", missingKey, orgID)
-			}
+		if _, err := c.writeEnabledMCPTools(enabledMap, modeRes.WantTrue, modeRes.WantNotTrue); err != nil {
+			settingErr = err
+			logger.Warn("Failed to set MCP tool permissions for org %s: %v", orgID, err)
 		}
 	}
 
@@ -801,14 +758,14 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 	}
 
 	status := "ok"
-	msg := fmt.Sprintf("Đã xóa %d server cũ, %s với %d tool (Always Allow)", deletedCount, actionDesc, len(toolsResp.Tools))
+	msg := fmt.Sprintf("Đã xóa %d server cũ, %s với %d tool (%s)", deletedCount, actionDesc, len(toolsResp.Tools), describeMCPModes(modeRes.AlwaysAllow, modeRes.UseTool))
 	var warnings []string
 	if renameWarn != "" {
 		warnings = append(warnings, renameWarn)
 	}
 	if len(toolsResp.Tools) == 0 {
 		status = "warning"
-		msg = fmt.Sprintf("Đã xóa %d server cũ, %s nhưng chưa tải được danh sách tool nên chưa bật Always Allow", deletedCount, actionDesc)
+		msg = fmt.Sprintf("Đã xóa %d server cũ, %s nhưng chưa tải được danh sách tool nên chưa áp quyền tool", deletedCount, actionDesc)
 		if lastToolsStatus != 0 {
 			msg += fmt.Sprintf(" (claude.ai /tools trả %d)", lastToolsStatus)
 		} else if lastToolsErr != nil {
@@ -837,7 +794,9 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 				detail += ", đang chờ đăng nhập"
 			}
 			detail += ")"
-			alwaysOK := settingErr == nil && missingAlways == 0
+			// With any "use tool" tool the API call would pause for approval,
+			// so only claim API calls work when every tool is Always Allow.
+			alwaysOK := settingErr == nil && missingAlways == 0 && modeRes.UseTool == 0
 			switch {
 			case state == "null" && len(toolsResp.Tools) > 0 && alwaysOK:
 				detail += " - gọi tool qua API thường vẫn hoạt động; nếu dùng UI hãy Connect trên claude.ai"
@@ -861,7 +820,7 @@ func (c *Client) SyncRemoteMCP(mcpName, mcpURL string, install *MCPInstall) (*Sy
 		warnings = append(warnings, fmt.Sprintf("%d tool thiếu always_approved_key", missingAlways))
 	}
 	if settingErr != nil && len(toolsResp.Tools) > 0 {
-		warnings = append(warnings, "chưa bật được Always Allow")
+		warnings = append(warnings, "chưa áp dụng được quyền tool")
 	}
 	if len(warnings) > 0 {
 		if status == "ok" {

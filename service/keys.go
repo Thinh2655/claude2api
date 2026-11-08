@@ -258,9 +258,15 @@ func ToolsSetHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"enableTools": body.Enabled})
 }
 
-// MCPGetHandler returns whether MCP tool support is enabled
+// MCPGetHandler returns whether MCP tool support is enabled, plus the stored
+// MCP tool permissions (default mode and per-tool overrides).
 func MCPGetHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"enableMCP": config.ConfigInstance.MCPEnabled()})
+	mode, modes := config.ConfigInstance.MCPToolPermissions()
+	c.JSON(http.StatusOK, gin.H{
+		"enableMCP": config.ConfigInstance.MCPEnabled(),
+		"toolMode":  mode,
+		"toolModes": modes,
+	})
 }
 
 // MCPSetHandler toggles MCP support and persists it to .env
@@ -514,6 +520,10 @@ func MCPSyncHandler(c *gin.Context) {
 		ClientID     string           `json:"clientId"`
 		ClientSecret string           `json:"clientSecret"`
 		Headers      []core.MCPHeader `json:"headers"`
+		// ToolMode / ToolModes are optional: default permission of every tool
+		// and per-tool overrides. Omitted fields keep the stored values.
+		ToolMode  string            `json:"toolMode"`
+		ToolModes map[string]string `json:"toolModes"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Dữ liệu JSON không hợp lệ"})
@@ -542,11 +552,23 @@ func MCPSyncHandler(c *gin.Context) {
 		return
 	}
 
+	toolMode, toolModes, err := resolveMCPPermissions(body.ToolMode, body.ToolModes)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		return
+	}
+	permsGiven := strings.TrimSpace(body.ToolMode) != "" || body.ToolModes != nil
+
 	if !mcpOpMu.TryLock() {
 		c.JSON(http.StatusConflict, ErrorResponse{Error: "Đang có thao tác MCP khác chạy, vui lòng thử lại sau"})
 		return
 	}
 	defer mcpOpMu.Unlock()
+
+	if permsGiven {
+		saveMCPPermissions(toolMode, toolModes)
+	}
+	perms := core.MCPToolPermissions{Default: toolMode, Tools: toolModes}
 
 	config.ConfigInstance.RwMutx.RLock()
 	sessionsCopy := make([]config.SessionInfo, len(config.ConfigInstance.Sessions))
@@ -575,7 +597,7 @@ func MCPSyncHandler(c *gin.Context) {
 
 			label := displayLabel(&sess)
 			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
-			res, syncErr := client.SyncRemoteMCP(mcpName, mcpURL, install)
+			res, syncErr := client.SyncRemoteMCP(mcpName, mcpURL, install, perms)
 			if syncErr != nil {
 				results[idx] = core.SyncMCPResult{
 					Account: label,

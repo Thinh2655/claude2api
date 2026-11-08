@@ -100,6 +100,14 @@ const keysPageHTML = `<!DOCTYPE html>
   .mcp-add-header { background: var(--bg); color: var(--text); border: 1px solid var(--border);
     margin-top: .5rem; }
   .mcp-add-header:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border); white-space: nowrap; }
+  .btn-secondary:disabled { opacity: .4; cursor: not-allowed; }
+  .badge.mode-allow { background: rgba(74,222,128,.15); color: var(--ok); }
+  .badge.mode-ask { background: rgba(96,165,250,.15); color: #60a5fa; }
+  .badge.mode-off { background: rgba(139,144,163,.15); color: var(--muted); }
+  .mcp-server { margin-top: 1rem; }
+  .mcp-tools-table td { padding: .5rem; vertical-align: top; }
+  .mcp-tools-table select { width: auto; min-width: 13rem; margin-bottom: 0; }
   .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
   .switch { position: relative; display: inline-block; width: 46px; height: 26px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; }
@@ -213,6 +221,14 @@ const keysPageHTML = `<!DOCTYPE html>
         </div>
       </div>
     </div>
+    <div class="mcp-field">
+      <label class="mcp-field-label" for="mcpToolMode">Quyền tool mặc định</label>
+      <select id="mcpToolMode" onchange="onMCPDefaultChange(this.value)">
+        <option value="always_allow" selected>Always allow - tự chạy, không hỏi</option>
+        <option value="use_tool">Use tool - hỏi duyệt mỗi lần gọi</option>
+      </select>
+      <div class="hint">Áp cho mọi tool của MCP khi đồng bộ; ghi đè riêng từng tool ở mục Quyền tool MCP bên dưới. Use tool chỉ duyệt được trên giao diện claude.ai (gateway); gọi qua API không có chỗ duyệt nên request sẽ bị dừng với lỗi cần duyệt.</div>
+    </div>
     <div class="mcp-section">
       <div class="mcp-section-title">Request headers</div>
       <div class="hint">Tối đa 4 header. Header có value sẽ được gửi kèm; header không có value vẫn được khai báo nếu không đánh dấu Bắt buộc.</div>
@@ -225,8 +241,27 @@ const keysPageHTML = `<!DOCTYPE html>
       <button class="btn-danger" id="mcpDeleteBtn" onclick="deleteMCP()" style="white-space:nowrap;">Xóa MCP custom</button>
     </div>
     <div class="msg" id="mcpSyncMsg"></div>
-    <div class="hint">Đồng bộ: xóa tất cả remote MCP custom cũ của từng tài khoản trong pool và thêm MCP mới với cấu hình xác thực/header bên trên (các tool luôn được bật Always Allow). Connector dùng OAuth có thể cần đăng nhập trên claude.ai sau khi tạo.<br>OAuth client ID/secret và giá trị header chỉ dùng cho lần đồng bộ này, không lưu vào .env.<br>Xóa MCP custom: xóa toàn bộ remote MCP custom của tất cả tài khoản, không thêm mới và không thể hoàn tác.</div>
+    <div class="hint">Đồng bộ: xóa tất cả remote MCP custom cũ của từng tài khoản trong pool và thêm MCP mới với cấu hình xác thực/header bên trên (quyền tool theo ô Quyền tool mặc định và các ghi đè riêng từng tool). Connector dùng OAuth có thể cần đăng nhập trên claude.ai sau khi tạo.<br>OAuth client ID/secret và giá trị header chỉ dùng cho lần đồng bộ này, không lưu vào .env.<br>Xóa MCP custom: xóa toàn bộ remote MCP custom của tất cả tài khoản, không thêm mới và không thể hoàn tác.</div>
     <div id="mcpSyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
+  </div>
+
+  <div class="card">
+    <h2>Quyền tool MCP</h2>
+    <div class="mcp-field">
+      <label class="mcp-field-label" for="mcpToolModePerm">Quyền mặc định</label>
+      <select id="mcpToolModePerm" onchange="onMCPDefaultChange(this.value)">
+        <option value="always_allow" selected>Always allow - tự chạy, không hỏi</option>
+        <option value="use_tool">Use tool - hỏi duyệt mỗi lần gọi</option>
+      </select>
+    </div>
+    <div style="display:flex; gap:.75rem; align-items:stretch;">
+      <button class="btn-secondary" id="mcpToolsLoadBtn" onclick="loadMCPTools()">Tải danh sách tool</button>
+      <button class="btn-primary" id="mcpPermApplyBtn" onclick="applyMCPPermissions()" style="flex:1;">Lưu và áp dụng cho tất cả tài khoản</button>
+    </div>
+    <div class="msg" id="mcpPermMsg"></div>
+    <div class="hint">Tải danh sách tool từ tài khoản đầu tiên đang bật, rồi chọn quyền riêng cho từng tool (để Theo mặc định = dùng quyền mặc định). Bấm Lưu và áp dụng để ghi vào mọi tài khoản trong pool, không xóa hay tạo lại connector. Quyền được lưu vào MCP_TOOL_MODE / MCP_TOOL_MODES và dùng cho các lần đồng bộ sau. Ghi đè theo tên tool, nên tool trùng tên ở nhiều MCP dùng chung một quyền.</div>
+    <div id="mcpToolsList"></div>
+    <div id="mcpPermResults" style="margin-top:.75rem; font-size:.85rem;"></div>
   </div>
 
   <div class="card">
@@ -478,11 +513,177 @@ async function saveLastImage(el) {
   }
 }
 
+const MCP_MODE_LABELS = { always_allow: 'Always allow', use_tool: 'Use tool', disabled: 'Tắt', unset: 'Chưa thiết lập' };
+// Per-tool overrides as stored on the server (tool name -> mode). mcpPermsReady
+// guards against sending an empty override map before the stored one was read.
+let mcpToolOverrides = {};
+let mcpPermsReady = false;
+let mcpToolsShown = false;
+
 async function loadMCP() {
   const res = await fetch('/keys/api/mcp', { headers });
   if (!res.ok) return;
   const data = await res.json();
   document.getElementById('mcpToggle').checked = !!data.enableMCP;
+  mcpToolOverrides = data.toolModes || {};
+  mcpPermsReady = true;
+  onMCPDefaultChange(data.toolMode || 'always_allow');
+}
+
+// Keeps the two default-mode selects (sync card + permission card) in step.
+function onMCPDefaultChange(value) {
+  ['mcpToolMode', 'mcpToolModePerm'].forEach(function(id) {
+    const el = document.getElementById(id);
+    if (el && el.value !== value) el.value = value;
+  });
+  refreshMCPDefaultLabels();
+}
+
+function refreshMCPDefaultLabels() {
+  const el = document.getElementById('mcpToolModePerm');
+  const def = el ? el.value : 'always_allow';
+  document.querySelectorAll('#mcpToolsList .mcp-tool-mode option[value=""]').forEach(function(o) {
+    o.textContent = 'Theo mặc định (' + (MCP_MODE_LABELS[def] || def) + ')';
+  });
+}
+
+function mcpModeBadge(mode) {
+  let cls = 'mode-off';
+  if (mode === 'always_allow') cls = 'mode-allow';
+  else if (mode === 'use_tool') cls = 'mode-ask';
+  return '<span class="badge ' + cls + '">' + escapeHtml(MCP_MODE_LABELS[mode] || mode) + '</span>';
+}
+
+function mcpModeOptions(selected) {
+  const opts = [['', 'Theo mặc định'], ['always_allow', 'Always allow'], ['use_tool', 'Use tool']];
+  return opts.map(function(o) {
+    return '<option value="' + o[0] + '"' + (o[0] === selected ? ' selected' : '') + '>' + o[1] + '</option>';
+  }).join('');
+}
+
+function renderMCPTools(servers) {
+  const box = document.getElementById('mcpToolsList');
+  if (!servers.length) {
+    box.innerHTML = '<div class="hint">Tài khoản này chưa có MCP custom nào. Hãy đồng bộ MCP trước.</div>';
+    return;
+  }
+  let html = '';
+  servers.forEach(function(s) {
+    html += '<div class="mcp-server"><div class="mcp-section-title">' + escapeHtml(s.name) +
+      ' <span class="hint">' + escapeHtml(s.url) + '</span></div>';
+    const tools = s.tools || [];
+    if (s.error) {
+      html += '<div class="hint" style="color:var(--err);">Không tải được tool: ' + escapeHtml(s.error) + '</div>';
+    } else if (!tools.length) {
+      html += '<div class="hint">Server không có tool nào.</div>';
+    } else {
+      html += '<table class="mcp-tools-table"><tbody>';
+      tools.forEach(function(t) {
+        html += '<tr><td><code>' + escapeHtml(t.name) + '</code>' +
+          (t.description ? '<div class="hint">' + escapeHtml(t.description) + '</div>' : '') + '</td>' +
+          '<td style="white-space:nowrap;">' + mcpModeBadge(t.mode) + '</td>' +
+          '<td><select class="mcp-tool-mode" data-tool="' + escapeHtml(t.name) + '">' +
+          mcpModeOptions(mcpToolOverrides[t.name] || '') + '</select></td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+  });
+  box.innerHTML = html;
+  refreshMCPDefaultLabels();
+}
+
+// Stored overrides, updated with what the visible selects say. Tools that are
+// not on screen (e.g. a server that failed to load) keep their stored mode.
+function collectMCPToolModes() {
+  const modes = Object.assign({}, mcpToolOverrides);
+  document.querySelectorAll('#mcpToolsList .mcp-tool-mode').forEach(function(sel) {
+    const tool = sel.getAttribute('data-tool');
+    if (sel.value) modes[tool] = sel.value;
+    else delete modes[tool];
+  });
+  return modes;
+}
+
+async function loadMCPTools(silent) {
+  const msg = document.getElementById('mcpPermMsg');
+  const box = document.getElementById('mcpToolsList');
+  setMCPBusy(true);
+  if (!silent) {
+    msg.textContent = 'Đang tải danh sách tool từ claude.ai...';
+    msg.className = 'msg';
+  }
+  try {
+    const res = await fetch('/keys/api/mcp/tools', { headers });
+    const data = await res.json();
+    if (!res.ok) {
+      mcpToolsShown = false;
+      box.innerHTML = '';
+      msg.textContent = data.message || data.error || 'Tải danh sách tool thất bại';
+      msg.className = 'msg error';
+      return;
+    }
+    mcpToolOverrides = data.toolModes || {};
+    mcpPermsReady = true;
+    onMCPDefaultChange(data.toolMode || 'always_allow');
+    renderMCPTools(data.servers || []);
+    mcpToolsShown = true;
+    if (!silent) {
+      msg.textContent = 'Đã tải từ tài khoản ' + data.account;
+      msg.className = 'msg success';
+    }
+  } catch (e) {
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    setMCPBusy(false);
+  }
+}
+
+async function applyMCPPermissions() {
+  const msg = document.getElementById('mcpPermMsg');
+  const resDiv = document.getElementById('mcpPermResults');
+  const mode = document.getElementById('mcpToolModePerm').value;
+  const payload = { toolMode: mode };
+  if (mcpPermsReady) payload.toolModes = collectMCPToolModes();
+  const overrides = payload.toolModes ? Object.keys(payload.toolModes).length : 0;
+
+  let confirmText = 'Áp dụng quyền tool MCP cho TOÀN BỘ tài khoản trong pool?\n\nMặc định: ' + (MCP_MODE_LABELS[mode] || mode);
+  if (overrides) confirmText += '\nGhi đè riêng: ' + overrides + ' tool';
+  if (mode === 'use_tool' || Object.keys(payload.toolModes || {}).some(function(k) { return payload.toolModes[k] === 'use_tool'; })) {
+    confirmText += '\n\nTool để Use tool sẽ yêu cầu duyệt trên claude.ai; gọi qua API sẽ bị dừng với lỗi cần duyệt.';
+  }
+  if (!confirm(confirmText)) return;
+
+  setMCPBusy(true);
+  msg.textContent = 'Đang áp dụng quyền tool cho các tài khoản... Vui lòng đợi trong giây lát.';
+  msg.className = 'msg';
+  resDiv.innerHTML = '';
+  let applied = false;
+  try {
+    const res = await fetch('/keys/api/mcp/permissions', {
+      method: 'POST', headers,
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msg.textContent = data.message || data.error || 'Áp dụng quyền tool thất bại';
+      msg.className = 'msg error';
+      return;
+    }
+    mcpToolOverrides = data.toolModes || {};
+    msg.textContent = data.message || 'Đã áp dụng quyền tool';
+    msg.className = 'msg success';
+    renderSyncResults(data.results, 'mcpPermResults');
+    applied = true;
+  } catch (e) {
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    setMCPBusy(false);
+  }
+  // Refresh the badges so they show what claude.ai now reports.
+  if (applied && mcpToolsShown) await loadMCPTools(true);
 }
 
 async function saveMCP(el) {
@@ -744,6 +945,8 @@ async function syncMCP() {
   const authMode = authModeEl ? authModeEl.value : 'no_auth';
   const registration = registrationEl ? registrationEl.value : 'cimd';
   const requestHeaders = collectMCPHeaders();
+  const toolModeEl = document.getElementById('mcpToolMode');
+  const toolMode = toolModeEl ? toolModeEl.value : 'always_allow';
 
   if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
     msg.textContent = 'Vui lòng nhập URL MCP hợp lệ (bắt đầu bằng http:// hoặc https://)';
@@ -775,7 +978,8 @@ async function syncMCP() {
   const authLabels = { auth_required: 'Đăng nhập ngay', defer_auth: 'Đăng nhập khi cần', no_auth: 'Không đăng nhập' };
   const regLabels = { cimd: 'CIMD', dcr: 'DCR', static_per_installation: 'OAuth client riêng' };
   let confirmText = 'Bạn có chắc muốn xóa tất cả MCP cũ và đồng bộ MCP mới cho TOÀN BỘ tài khoản trong pool không?\n\n' +
-    'Tên: ' + name + '\nURL: ' + url + '\nXác thực: ' + (authLabels[authMode] || authMode);
+    'Tên: ' + name + '\nURL: ' + url + '\nXác thực: ' + (authLabels[authMode] || authMode) +
+    '\nQuyền tool mặc định: ' + (MCP_MODE_LABELS[toolMode] || toolMode);
   if (requestHeaders.length) {
     confirmText += '\nRequest headers: ' + requestHeaders.length;
   }
@@ -800,7 +1004,7 @@ async function syncMCP() {
   resDiv.innerHTML = '';
 
   try {
-    const payload = { name: name, url: url, authMode: authMode, headers: requestHeaders };
+    const payload = { name: name, url: url, authMode: authMode, headers: requestHeaders, toolMode: toolMode };
     if (authMode !== 'no_auth') {
       payload.registration = registration;
       if (registration === 'static_per_installation') {
@@ -867,7 +1071,7 @@ async function deleteMCP() {
 }
 
 function setMCPBusy(busy) {
-  ['mcpSyncBtn', 'mcpDeleteBtn', 'mcpAddHeaderBtn'].forEach(function(id) {
+  ['mcpSyncBtn', 'mcpDeleteBtn', 'mcpAddHeaderBtn', 'mcpToolsLoadBtn', 'mcpPermApplyBtn'].forEach(function(id) {
     const el = document.getElementById(id);
     if (!el) return;
     el.disabled = busy;
