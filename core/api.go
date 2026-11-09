@@ -901,6 +901,29 @@ func (c *Client) SendMessage(conversationID string, message string, stream bool,
 	return 200, nil
 }
 
+// toolCallBlockPrefix mirrors the fence model.StreamToolFilter treats as a
+// function-call block; text that starts with it must not be padded.
+const toolCallBlockPrefix = "```toolcall"
+
+// textBlockSeparator returns the break to put between two separate upstream
+// text blocks. claude.ai starts a new text block after every tool call and the
+// deltas are concatenated here, so without a break the next block runs straight
+// into the previous sentence ("...tạo code.Giờ build..."). It returns "" when
+// there is nothing to separate, when a newline is already there, or when the
+// response is a function-call block that must be kept byte-exact.
+func textBlockSeparator(prev, next string) string {
+	if prev == "" || next == "" {
+		return ""
+	}
+	if strings.HasSuffix(prev, "\n") || strings.HasPrefix(next, "\n") {
+		return ""
+	}
+	if strings.HasPrefix(strings.TrimLeft(prev, " \t\r\n"), toolCallBlockPrefix) {
+		return ""
+	}
+	return "\n\n"
+}
+
 // HandleResponse converts Claude's SSE format to OpenAI format and writes to the response writer
 // Returns nil if the request completed successfully (or the error came after content
 // was already streamed), or an error if it failed early enough to allow a clean retry.
@@ -956,6 +979,9 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	pendingJSON := ""
 	skipToolCode := false
 	toolLogEmitted := false
+	// newTextBlock is set when a new upstream text block starts, so its first
+	// delta can be separated from whatever was written before the block.
+	newTextBlock := false
 	// Diagnostic: count the upstream event types, so a 200 with no usable
 	// content (dashboard shows Out ↓ = 0) can be traced to an unhandled delta
 	// type without re-enabling the full SSE dump.
@@ -1018,6 +1044,9 @@ scan:
 				pendingJSON = ""
 				toolLogEmitted = false
 				skipToolCode = event.ContentBlock.Type == "tool_use" && isSilentCodeTool(event.ContentBlock.Name)
+				if event.ContentBlock.Type == "text" {
+					newTextBlock = true
+				}
 				continue
 			}
 			if event.Type == "content_block_stop" {
@@ -1064,6 +1093,15 @@ scan:
 			}
 			if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
 				res_text := event.Delta.Text
+				if newTextBlock {
+					newTextBlock = false
+					if sep := textBlockSeparator(res_all_text, res_text); sep != "" {
+						res_all_text += sep
+						if stream {
+							toolFilter.Feed(sep, stream, gc)
+						}
+					}
+				}
 				res_all_text += res_text
 				if !stream {
 					continue
