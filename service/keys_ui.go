@@ -24,7 +24,7 @@ const keysPageHTML = `<!DOCTYPE html>
     background: var(--bg); color: var(--text);
     min-height: 100vh; padding: 2rem;
   }
-  .container { max-width: 760px; margin: 0 auto; }
+  .container { max-width: 1040px; margin: 0 auto; }
   h1 { font-size: 1.5rem; margin-bottom: .25rem; }
   .subtitle { color: var(--muted); font-size: .9rem; margin-bottom: 2rem; }
   .card {
@@ -93,6 +93,7 @@ const keysPageHTML = `<!DOCTYPE html>
     margin-bottom: 0; flex: 1 1 120px;
   }
   .mcp-header-row .mcp-header-name { flex: 1 1 150px; }
+  .mcp-header-row select.mcp-header-preset { width: auto; flex: 0 0 150px; margin-bottom: 0; }
   .mcp-header-row .mcp-header-value { flex: 2 1 180px; }
   .mcp-header-row button { padding: .4rem .6rem; }
   .mcp-required { display: flex; align-items: center; gap: .3rem; font-size: .8rem;
@@ -118,6 +119,40 @@ const keysPageHTML = `<!DOCTYPE html>
   .switch input:checked + .slider { background: var(--ok); }
   .switch input:checked + .slider:before { transform: translateX(20px); }
   .switch input:disabled + .slider { opacity: .5; cursor: wait; }
+  [hidden] { display: none !important; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem; margin-bottom: 1rem; }
+  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: .8rem 1rem; min-width: 0; }
+  .stat .n { font-size: 1.6rem; font-weight: 700; line-height: 1.15; }
+  .stat .n.txt { font-size: 1rem; line-height: 1.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stat .l { color: var(--muted); font-size: .78rem; margin-top: .15rem; }
+  .stat.ok .n { color: var(--ok); }
+  .stat.warn .n { color: var(--warn); }
+  .stat.off .n { color: var(--muted); }
+  .tabs { position: sticky; top: 0; z-index: 20; display: flex; gap: .25rem; background: var(--bg);
+    padding: .5rem 0; margin-bottom: 1rem; border-bottom: 1px solid var(--border); overflow-x: auto; }
+  .tab-btn { background: transparent; color: var(--muted); border-radius: 8px 8px 0 0; padding: .55rem 1.1rem;
+    white-space: nowrap; font-size: .9rem; }
+  .tab-btn:hover { opacity: 1; color: var(--text); }
+  .tab-btn.active { background: var(--card); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+  .toolbar { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; margin-bottom: .75rem; }
+  .toolbar input[type=text] { flex: 1 1 200px; margin-bottom: 0; font-family: inherit; }
+  .toolbar select { width: auto; margin-bottom: 0; }
+  .table-wrap { overflow-x: auto; }
+  .empty-row td { text-align: center; color: var(--muted); padding: 1.5rem .5rem; }
+  .badge.off { background: rgba(139,144,163,.15); color: var(--muted); }
+  .badge.bad { background: rgba(248,113,113,.15); color: var(--err); }
+  .toast-box { position: fixed; right: 1rem; bottom: 1rem; display: flex; flex-direction: column; gap: .5rem; z-index: 100; }
+  .toast { background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--accent);
+    padding: .65rem .9rem; border-radius: 8px; font-size: .85rem; max-width: 340px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.4); }
+  .toast.success { border-left-color: var(--ok); }
+  .toast.error { border-left-color: var(--err); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  @media (max-width: 640px) {
+    body { padding: 1rem; }
+    .mcp-form-grid { flex-direction: column; align-items: stretch; }
+    .switch-row { align-items: flex-start; }
+  }
 </style>
 </head>
 <body>
@@ -129,21 +164,48 @@ const keysPageHTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="card">
-    <h2>Tài khoản</h2>
-    <table id="keysTable">
-      <thead><tr><th>Tên acc</th><th>Trạng thái</th><th>Gateway</th><th style="text-align:center;">Bật</th><th></th></tr></thead>
-      <tbody id="keysBody"></tbody>
-    </table>
-    <div style="margin-top:.75rem; display:flex; gap:.75rem; align-items:center;">
-      <button id="checkBtn" onclick="checkKeys('')" style="background:rgba(217,119,87,.15); color:var(--accent);">Kiểm tra tất cả (claude.ai)</button>
-      <span class="hint" id="checkStatus"></span>
-    </div>
-    <div class="msg" id="listMsg"></div>
-    <div class="hint" style="margin-top:.5rem;">Chọn radio ở cột Gateway để đặt tài khoản dùng cho giao diện claude.ai tại cổng local. Để trống (không chọn) = tự chọn tài khoản có cookie.</div>
+  <div class="stats">
+    <div class="stat"><div class="n" id="statTotal">–</div><div class="l">Tổng tài khoản</div></div>
+    <div class="stat ok"><div class="n" id="statReady">–</div><div class="l">Khả dụng</div></div>
+    <div class="stat warn"><div class="n" id="statLimited">–</div><div class="l">Tạm khóa (limit)</div></div>
+    <div class="stat off"><div class="n" id="statDisabled">–</div><div class="l">Đã tắt</div></div>
+    <div class="stat"><div class="n" id="statTokens">–</div><div class="l">Token đã dùng</div><div class="l" id="statTokensSub" style="font-size:.72rem;"></div></div>
   </div>
 
-  <div class="card">
+  <div class="tabs" role="tablist">
+    <button type="button" class="tab-btn active" data-tab="accounts" onclick="showTab('accounts')">Tài khoản</button>
+    <button type="button" class="tab-btn" data-tab="settings" onclick="showTab('settings')">Cài đặt</button>
+    <button type="button" class="tab-btn" data-tab="mcp" onclick="showTab('mcp')">MCP</button>
+  </div>
+
+  <div class="card" data-tab="accounts">
+    <h2>Tài khoản</h2>
+    <div class="toolbar">
+      <input type="text" id="accSearch" placeholder="Tìm theo tên tài khoản..." autocomplete="off" oninput="onAccFilterChange()">
+      <select id="accState" onchange="onAccFilterChange()">
+        <option value="all">Tất cả trạng thái</option>
+        <option value="ready">Khả dụng</option>
+        <option value="cooling">Đang nghỉ</option>
+        <option value="limited">Tạm khóa (limit)</option>
+        <option value="disabled">Đã tắt</option>
+      </select>
+      <button id="checkBtn" onclick="checkKeys('')" style="background:rgba(217,119,87,.15); color:var(--accent);">Kiểm tra tất cả (claude.ai)</button>
+    </div>
+    <div class="hint" id="checkStatus" style="margin:0 0 .5rem;"></div>
+    <div class="table-wrap">
+    <table id="keysTable">
+      <thead><tr><th>Tên acc</th><th>Trạng thái</th><th style="text-align:center;" title="Tài khoản dùng cho giao diện claude.ai tại cổng local">Gateway</th><th style="text-align:center;" title="Bật = tài khoản tham gia xoay vòng request">Kích hoạt</th><th></th></tr></thead>
+      <tbody id="keysBody"></tbody>
+    </table>
+    </div>
+    <div style="margin-top:.75rem; display:flex; gap:.75rem; align-items:center; flex-wrap:wrap;">
+      <button class="btn-secondary" id="gwClearBtn" onclick="saveGatewayKey('')" title="Để hệ thống tự chọn tài khoản có cookie">Gateway: tự động chọn</button>
+    </div>
+    <div class="msg" id="listMsg"></div>
+    <div class="hint" style="margin-top:.5rem;">Gateway: chọn radio để cố định tài khoản dùng cho giao diện claude.ai tại cổng local, hoặc bấm "Gateway: tự động chọn" để hệ thống tự chọn. Kích hoạt: tắt công tắc để loại tài khoản khỏi vòng xoay request (không xóa).</div>
+  </div>
+
+  <div class="card" data-tab="settings">
     <h2>Cài đặt</h2>
     <div class="switch-row">
       <div>
@@ -180,12 +242,12 @@ const keysPageHTML = `<!DOCTYPE html>
     <div class="msg" id="mcpMsg"></div>
   </div>
 
-  <div class="card">
+  <div class="card" data-tab="mcp">
     <h2>Đồng bộ MCP</h2>
     <div class="mcp-form-grid">
       <div>
         <label class="mcp-field-label" for="mcpSyncName">Tên MCP</label>
-        <input type="text" id="mcpSyncName" placeholder="Tên MCP (vd: tool)" autocomplete="off" value="tool">
+        <input type="text" id="mcpSyncName" placeholder="Tên MCP (vd: agent-mcp)" autocomplete="off" value="agent-mcp">
       </div>
       <div class="mcp-url-field">
         <label class="mcp-field-label" for="mcpSyncUrl">URL MCP</label>
@@ -245,7 +307,7 @@ const keysPageHTML = `<!DOCTYPE html>
     <div id="mcpSyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
   </div>
 
-  <div class="card">
+  <div class="card" data-tab="mcp">
     <h2>Quyền tool MCP</h2>
     <div class="mcp-field">
       <label class="mcp-field-label" for="mcpToolModePerm">Quyền mặc định</label>
@@ -264,7 +326,7 @@ const keysPageHTML = `<!DOCTYPE html>
     <div id="mcpPermResults" style="margin-top:.75rem; font-size:.85rem;"></div>
   </div>
 
-  <div class="card">
+  <div class="card" data-tab="settings">
     <h2>Đồng bộ quyền riêng tư</h2>
     <div class="switch-row">
       <div>
@@ -294,7 +356,7 @@ const keysPageHTML = `<!DOCTYPE html>
     <div id="privacySyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
   </div>
 
-  <div class="card">
+  <div class="card" data-tab="settings">
     <h2>Bộ nhớ</h2>
     <div class="switch-row">
       <div>
@@ -314,24 +376,27 @@ const keysPageHTML = `<!DOCTYPE html>
     <div id="memorySyncResults" style="margin-top:.75rem; font-size:.85rem;"></div>
   </div>
 
-  <div class="card">
+  <div class="card" data-tab="accounts">
     <h2>Thêm tài khoản (dán cookie)</h2>
     <textarea id="newCookie" placeholder='Dán JSON mảng cookie (EditThisCookie/Cookie-Editor export) tại đây' autocomplete="off"></textarea>
-    <button class="btn-primary" onclick="addAccount()">Thêm vào pool</button>
+    <button class="btn-primary" id="addBtn" onclick="addAccount()">Thêm vào pool</button>
     <div class="msg" id="addMsg"></div>
     <div class="hint">Cookie được lưu vào <code>accounts.json</code> và áp dụng tức thì. Tên acc tự lấy từ claude.ai.</div>
   </div>
 
-  <div class="card">
+  <div class="card" data-tab="accounts">
     <h2>5 request mới nhất</h2>
+    <div class="table-wrap">
     <table id="recentTable">
       <thead><tr><th>Thời gian</th><th>Tài khoản</th><th>Model</th><th style="text-align:right;">In ↑</th><th style="text-align:right;">Out ↓</th><th>Kết quả</th><th style="text-align:right;">Ký tự</th><th>Nội dung</th></tr></thead>
       <tbody id="recentBody">
         <tr><td colspan="8" style="color:var(--muted);">Chưa có request nào</td></tr>
       </tbody>
     </table>
+    </div>
   </div>
 </div>
+<div class="toast-box" id="toastBox" aria-live="polite"></div>
 
 <script>
 const API_KEY = new URLSearchParams(location.search).get('apikey') || localStorage.getItem('c2a_apikey') || '';
@@ -350,6 +415,7 @@ function fmtCountdown(sec) {
 }
 
 function statusBadge(k) {
+  if (k.disabled) return '<span class="badge off" title="Tài khoản đã bị tắt, không nhận request">Đã tắt</span>';
   // Usage-limit lock from the server (chat flow or /check 429) takes priority:
   // it carries the live countdown, unlike the one-shot manual check result.
   if (k.limited) {
@@ -397,52 +463,155 @@ function label(k) {
 
 let gatewayKey = '';
 
-async function loadKeys() {
-  const res = await fetch('/keys/api', { headers });
-  if (res.status === 401) {
-    document.getElementById('listMsg').textContent = 'Thiếu API key — mở trang dạng /keys?apikey=<APIKEY của bạn>';
-    document.getElementById('listMsg').className = 'msg error';
+let lastKeys = [];
+let lastKeysSig = '';
+let gatewayLoaded = false;
+const accFilter = { q: '', state: 'all' };
+
+function keyState(k) {
+  if (k.disabled) return 'disabled';
+  if (k.limited) return 'limited';
+  if (k.cooling) return 'cooling';
+  return 'ready';
+}
+
+function toast(text, type) {
+  const box = document.getElementById('toastBox');
+  if (!box) return;
+  const el = document.createElement('div');
+  el.className = 'toast' + (type ? ' ' + type : '');
+  el.textContent = text;
+  box.appendChild(el);
+  setTimeout(function() { el.remove(); }, type === 'error' ? 6000 : 3500);
+}
+
+function onAccFilterChange() {
+  accFilter.q = (document.getElementById('accSearch').value || '').trim().toLowerCase();
+  accFilter.state = document.getElementById('accState').value;
+  renderKeys(true);
+}
+
+function showTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+  });
+  document.querySelectorAll('.card[data-tab]').forEach(function(c) {
+    c.hidden = c.getAttribute('data-tab') !== name;
+  });
+  try { localStorage.setItem('c2a_tab', name); } catch (e) { /* storage blocked */ }
+}
+
+function updateStats() {
+  let limited = 0, disabled = 0, ready = 0;
+  lastKeys.forEach(function(k) {
+    if (k.disabled) disabled++;
+    else if (k.limited) limited++;
+    else ready++;
+  });
+  document.getElementById('statTotal').textContent = lastKeys.length;
+  document.getElementById('statReady').textContent = ready;
+  document.getElementById('statLimited').textContent = limited;
+  document.getElementById('statDisabled').textContent = disabled;
+  document.getElementById('gwClearBtn').disabled = !gatewayKey;
+}
+
+// Compact number for the stat card: 950, 12.3K, 4.56M.
+function fmtCompact(n) {
+  n = Number(n) || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+  if (n >= 1e4) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+  return fmt(n);
+}
+
+// Totals are counted by the server since it started (in-memory, reset on restart).
+function updateTokenStat(totals) {
+  const nEl = document.getElementById('statTokens');
+  const subEl = document.getElementById('statTokensSub');
+  if (!nEl || !totals) return;
+  const p = totals.promptTokens || 0, c = totals.completionTokens || 0;
+  nEl.textContent = fmtCompact(p + c);
+  nEl.title = fmt(p + c) + ' token';
+  subEl.textContent = '↑ ' + fmtCompact(p) + ' · ↓ ' + fmtCompact(c) + ' · ' + fmt(totals.requests || 0) + ' req';
+  subEl.title = 'Tính từ lúc server khởi động (về 0 khi khởi động lại)';
+}
+
+function renderKeys(force) {
+  updateStats();
+  const filtered = lastKeys.filter(function(k) {
+    if (accFilter.state !== 'all' && keyState(k) !== accFilter.state) return false;
+    if (accFilter.q && label(k).toLowerCase().indexOf(accFilter.q) === -1) return false;
+    return true;
+  });
+  // Skip the DOM rebuild when nothing visible changed (countdowns tick on their own).
+  const sig = JSON.stringify([gatewayKey, accFilter, filtered.map(function(k) {
+    const cr = checkResults[k.full];
+    return [k.full, k.displayName, k.disabled, k.limited, k.limitedUntil, k.cooling, cr ? cr.status : ''];
+  })]);
+  if (!force && sig === lastKeysSig) return;
+  lastKeysSig = sig;
+
+  const tbody = document.getElementById('keysBody');
+  if (!filtered.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">' +
+      (lastKeys.length ? 'Không có tài khoản nào khớp bộ lọc' : 'Chưa có tài khoản nào — hãy dán cookie ở mục "Thêm tài khoản" bên dưới') +
+      '</td></tr>';
     return;
   }
-  const data = await res.json();
-  const tbody = document.getElementById('keysBody');
-  tbody.innerHTML = '';
-  let limitedCount = 0;
-  for (const k of data.keys) {
-    if (k.limited) limitedCount++;
-    const tr = document.createElement('tr');
-    const checked = k.full === gatewayKey ? ' checked' : '';
+  tbody.innerHTML = filtered.map(function(k) {
+    const key = escapeHtml(k.full);
     const locked = !!k.limited;
     const unusable = k.disabled || locked;
-    let actions =
-        '<button class="btn-danger" style="margin-right:.4rem;" onclick="checkKeys(\'' + escapeHtml(k.full) + '\')">Kiểm tra</button>';
+    const isGw = k.full === gatewayKey;
+    let actions = '<button class="btn-secondary" style="margin-right:.4rem;" data-act="check" data-key="' + key + '">Kiểm tra</button>';
     if (locked) {
-      actions += '<button style="margin-right:.4rem; background:rgba(74,222,128,.15); color:var(--ok);" onclick="unlockAccount(\'' + escapeHtml(k.full) + '\')">Mở khóa</button>';
+      actions += '<button style="margin-right:.4rem; background:rgba(74,222,128,.15); color:var(--ok);" data-act="unlock" data-key="' + key + '">Mở khóa</button>';
     }
-    actions += '<button class="btn-danger" onclick="deleteAccount(\'' + escapeHtml(k.full) + '\')">Xóa</button>';
-    tr.innerHTML =
-      '<td><code' + (k.disabled ? ' style="opacity:.45; text-decoration:line-through;"' : '') + '>' + escapeHtml(label(k)) + '</code>' +
-      (locked && k.limitedUntil ? '<div class="hint" style="margin-top:.2rem;">mở lại lúc ' + escapeHtml(k.limitedUntil) + '</div>' : '') + '</td>' +
+    actions += '<button class="btn-danger" data-act="delete" data-key="' + key + '">Xóa</button>';
+    let notes = '';
+    if (locked && k.limitedUntil) notes += '<div class="hint" style="margin-top:.2rem;">mở lại lúc ' + escapeHtml(k.limitedUntil) + '</div>';
+    if (isGw && unusable) notes += '<div class="hint" style="margin-top:.2rem; color:var(--warn);">Đang là gateway nhưng hiện không dùng được</div>';
+    return '<tr>' +
+      '<td><code' + (k.disabled ? ' style="opacity:.45; text-decoration:line-through;"' : '') + '>' + escapeHtml(label(k)) + '</code>' + notes + '</td>' +
       '<td>' + statusBadge(k) + '</td>' +
-      '<td style="text-align:center;"><input type="radio" name="gw" value="' + escapeHtml(k.full) + '"' + checked + (unusable ? ' disabled' : '') + ' onchange="saveGatewayKey(this.value)"></td>' +
-      '<td style="text-align:center;"><input type="checkbox"' + (k.disabled ? ' checked' : '') + ' onchange="toggleAccount(this, \'' + escapeHtml(k.full) + '\')"></td>' +
-      '<td style="text-align:right; white-space:nowrap;">' + actions + '</td>';
-    tbody.appendChild(tr);
+      '<td style="text-align:center;"><input type="radio" name="gw" data-key="' + key + '"' + (isGw ? ' checked' : '') + (unusable ? ' disabled' : '') + '></td>' +
+      '<td style="text-align:center;"><label class="switch" title="' + (k.disabled ? 'Đang tắt — bấm để bật' : 'Đang bật — bấm để tắt') + '"><input type="checkbox" class="acc-toggle" data-key="' + key + '"' + (k.disabled ? '' : ' checked') + '><span class="slider"></span></label></td>' +
+      '<td style="text-align:right; white-space:nowrap;">' + actions + '</td></tr>';
+  }).join('');
+}
+
+async function loadKeys() {
+  let res;
+  try {
+    res = await fetch('/keys/api', { headers });
+  } catch (e) {
+    return; // transient network error: keep the last render, retry on next poll
   }
   const listMsg = document.getElementById('listMsg');
-  if (limitedCount > 0 && !listMsg.textContent) {
-    listMsg.textContent = limitedCount + ' tài khoản đang tạm khóa (limit) — request sẽ bỏ qua các acc này tới khi đếm ngược xong';
+  if (res.status === 401) {
+    listMsg.textContent = 'Thiếu API key — mở trang dạng /keys?apikey=<APIKEY của bạn>';
     listMsg.className = 'msg error';
+    return;
   }
+  if (listMsg.className === 'msg error' && listMsg.textContent.indexOf('Thiếu API key') === 0) {
+    listMsg.textContent = '';
+    listMsg.className = 'msg';
+  }
+  const data = await res.json();
+  lastKeys = data.keys || [];
 
-  // keep the gateway selection in sync with the server once on load
-  const gwRes = await fetch('/keys/api/gateway', { headers });
-  if (gwRes.ok) {
-    const gwData = await gwRes.json();
-    if (!gatewayKey) gatewayKey = gwData.gatewayKey || '';
-    const radio = document.querySelector('input[name="gw"][value="' + cssEscape(gatewayKey) + '"]');
-    if (radio) radio.checked = true;
+  // read the gateway selection from the server once, before the first render
+  if (!gatewayLoaded) {
+    try {
+      const gwRes = await fetch('/keys/api/gateway', { headers });
+      if (gwRes.ok) {
+        const gwData = await gwRes.json();
+        gatewayKey = gwData.gatewayKey || '';
+      }
+      gatewayLoaded = true;
+    } catch (e) { /* retry on next poll */ }
   }
+  renderKeys(false);
 }
 
 function cssEscape(s) { return s.replace(/"/g, '\\"'); }
@@ -824,6 +993,7 @@ function updateMCPAuthUI() {
   document.getElementById('mcpStaticOAuthFields').style.display = oauth && regEl.value === 'static_per_installation' ? '' : 'none';
 
   const hint = document.getElementById('mcpAuthHint');
+  updateMCPPresetState();
   if (mode === 'auth_required') {
     hint.textContent = 'Mỗi người dùng phải đăng nhập qua OAuth của server trước khi dùng tool.';
   } else if (mode === 'defer_auth') {
@@ -833,21 +1003,86 @@ function updateMCPAuthUI() {
   }
 }
 
-function addMCPHeader(name, value, required) {
+const MCP_HEADER_DEFAULT = 'x-api-key';
+const MCP_HEADER_PRESETS = [
+  'authorization', 'x-api-key', 'api-key', 'apikey', 'x-apikey', 'x-api-token', 'api-token',
+  'x-auth-token', 'x-access-token', 'x-token', 'x-key', 'access-key', 'x-api-secret',
+  'x-secret-key', 'x-app-key', 'x-app-id', 'x-application-key', 'x-application-id',
+  'x-client-key', 'x-client-id', 'x-client-secret', 'app-key', 'ocp-apim-subscription-key',
+  'x-functions-key', 'x-gateway-api-key', 'x-gateway-key', 'x-rapidapi-key', 'x-rapidapi-host',
+  'x-tenant-id', 'x-tenant', 'x-tenant-key', 'x-org-id', 'x-org', 'x-organization',
+  'x-organization-id', 'x-workspace-id', 'x-workspace', 'x-account-id', 'x-account-key',
+  'x-project-id', 'x-project-key', 'x-environment', 'x-cost-center', 'x-department',
+  'x-business-unit'
+];
+
+function mcpAuthIsOAuth() {
+  const modeEl = document.getElementById('mcpAuthMode');
+  return !!modeEl && modeEl.value !== 'no_auth';
+}
+
+// Authorization do OAuth quản lý nên bị vô hiệu hóa khi không ở chế độ "Không đăng nhập".
+function updateMCPPresetState() {
+  const oauth = mcpAuthIsOAuth();
+  document.querySelectorAll('#mcpHeaderRows .mcp-header-preset option[value="authorization"]').forEach(function(opt) {
+    opt.disabled = oauth;
+  });
+}
+
+function buildMCPHeaderPreset(nameInput) {
+  const select = document.createElement('select');
+  select.className = 'mcp-header-preset';
+  select.title = 'Chọn nhanh tên header';
+
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Chọn nhanh…';
+  select.appendChild(placeholder);
+
+  MCP_HEADER_PRESETS.forEach(function(h) {
+    const opt = document.createElement('option');
+    opt.value = h;
+    opt.textContent = h;
+    select.appendChild(opt);
+  });
+
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = 'Tiêu đề tùy chỉnh…';
+  select.appendChild(custom);
+
+  select.onchange = function() {
+    if (select.value === '__custom__') {
+      nameInput.value = '';
+      nameInput.focus();
+    } else if (select.value) {
+      nameInput.value = select.value;
+      const row = nameInput.closest('.mcp-header-row');
+      if (row) delete row.dataset.defaultRow;
+    }
+    select.value = '';
+  };
+  return select;
+}
+
+function addMCPHeader(name, value, required, isDefault) {
   const rows = document.getElementById('mcpHeaderRows');
   if (!rows) return;
   if (rows.children.length >= 4) return;
 
   const row = document.createElement('div');
   row.className = 'mcp-header-row';
+  // Dòng mặc định (x-api-key) còn nguyên và chưa có value thì bị bỏ qua khi đồng bộ.
+  if (isDefault) row.dataset.defaultRow = '1';
 
   const nameInput = document.createElement('input');
   nameInput.type = 'text';
   nameInput.className = 'mcp-header-name';
-  nameInput.placeholder = 'Tên header (vd: X-Api-Key)';
+  nameInput.placeholder = 'Tên header (vd: x-api-key)';
   nameInput.maxLength = 64;
   nameInput.autocomplete = 'off';
   nameInput.value = name || '';
+  nameInput.addEventListener('input', function() { delete row.dataset.defaultRow; });
 
   const valueInput = document.createElement('input');
   valueInput.type = 'password';
@@ -872,10 +1107,12 @@ function addMCPHeader(name, value, required) {
   removeButton.onclick = function() { removeMCPHeader(this); };
 
   row.appendChild(nameInput);
+  row.appendChild(buildMCPHeaderPreset(nameInput));
   row.appendChild(valueInput);
   row.appendChild(requiredLabel);
   row.appendChild(removeButton);
   rows.appendChild(row);
+  updateMCPPresetState();
   updateMCPHeaderControls();
 }
 
@@ -903,6 +1140,7 @@ function collectMCPHeaders() {
     const name = (nameInput.value || '').trim();
     const value = (valueInput.value || '').trim();
     if (!name && !value) return;
+    if (row.dataset.defaultRow === '1' && !value) return;
     headers.push({ name: name, value: value, required: !!(requiredInput && requiredInput.checked) });
   });
   return headers;
@@ -930,13 +1168,13 @@ function validateMCPHeaders(headers, authMode) {
 function initMCPForm() {
   updateMCPAuthUI();
   const rows = document.getElementById('mcpHeaderRows');
-  if (rows && rows.children.length === 0) addMCPHeader();
+  if (rows && rows.children.length === 0) addMCPHeader(MCP_HEADER_DEFAULT, '', true, true);
 }
 
 async function syncMCP() {
   const nameInput = document.getElementById('mcpSyncName');
   const urlInput = document.getElementById('mcpSyncUrl');
-  const name = (nameInput.value || '').trim() || 'tool';
+  const name = (nameInput.value || '').trim() || 'agent-mcp';
   const url = (urlInput.value || '').trim();
   const msg = document.getElementById('mcpSyncMsg');
   const resDiv = document.getElementById('mcpSyncResults');
@@ -1112,43 +1350,52 @@ function renderSyncResults(results, containerId) {
 }
 
 async function toggleAccount(cb, key) {
-  const msg = document.getElementById('listMsg');
+  const enable = cb.checked;
   cb.disabled = true;
   try {
     const res = await fetch('/keys/api/toggle', {
       method: 'POST', headers,
-      body: JSON.stringify({ key, disabled: cb.checked })
+      body: JSON.stringify({ key, disabled: !enable })
     });
+    const data = await res.json().catch(function() { return {}; });
     if (!res.ok) {
-      const data = await res.json();
-      cb.checked = !cb.checked;
-      msg.textContent = data.message || data.error || 'Lưu thất bại';
-      msg.className = 'msg error';
+      cb.checked = !enable;
       cb.disabled = false;
+      toast(data.message || data.error || 'Lưu thất bại', 'error');
       return;
     }
+    toast(enable ? 'Đã bật tài khoản' : 'Đã tắt tài khoản — sẽ không nhận request', 'success');
     // re-render so the row reflects the new enabled/disabled look
     loadKeys();
   } catch (e) {
-    cb.checked = !cb.checked;
-    msg.textContent = 'Lỗi kết nối: ' + e.message;
-    msg.className = 'msg error';
+    cb.checked = !enable;
     cb.disabled = false;
+    toast('Lỗi kết nối: ' + e.message, 'error');
   }
 }
 
 function fmt(n) { return String(n || 0).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
 
 async function saveGatewayKey(key) {
+  const prev = gatewayKey;
   gatewayKey = key || '';
-  const res = await fetch('/keys/api/gateway', {
-    method: 'POST', headers,
-    body: JSON.stringify({ key: gatewayKey })
-  });
-  const data = await res.json();
-  const msg = document.getElementById('listMsg');
-  msg.textContent = data.message || data.error;
-  msg.className = res.ok ? 'msg success' : 'msg error';
+  try {
+    const res = await fetch('/keys/api/gateway', {
+      method: 'POST', headers,
+      body: JSON.stringify({ key: gatewayKey })
+    });
+    const data = await res.json().catch(function() { return {}; });
+    if (!res.ok) {
+      gatewayKey = prev;
+      toast(data.message || data.error || 'Lưu gateway thất bại', 'error');
+    } else {
+      toast(data.message || (gatewayKey ? 'Đã đặt tài khoản gateway' : 'Gateway sẽ tự chọn tài khoản'), 'success');
+    }
+  } catch (e) {
+    gatewayKey = prev;
+    toast('Lỗi kết nối: ' + e.message, 'error');
+  }
+  renderKeys(true);
 }
 
 function escapeHtml(s) {
@@ -1158,43 +1405,64 @@ function escapeHtml(s) {
 async function addAccount() {
   const cookie = document.getElementById('newCookie').value.trim();
   const msg = document.getElementById('addMsg');
+  const btn = document.getElementById('addBtn');
   if (!cookie) { msg.textContent = 'Dán JSON cookie trước'; msg.className = 'msg error'; return; }
-  const res = await fetch('/keys/api/add', {
-    method: 'POST', headers,
-    body: JSON.stringify({ cookie })
-  });
-  const data = await res.json();
-  msg.textContent = data.message || data.error;
-  msg.className = res.ok ? 'msg success' : 'msg error';
-  if (res.ok) {
-    document.getElementById('newCookie').value = '';
+  btn.disabled = true;
+  msg.textContent = 'Đang kiểm tra cookie và thêm vào pool...';
+  msg.className = 'msg';
+  try {
+    const res = await fetch('/keys/api/add', {
+      method: 'POST', headers,
+      body: JSON.stringify({ cookie })
+    });
+    const data = await res.json().catch(function() { return {}; });
+    msg.textContent = data.message || data.error || (res.ok ? 'Đã thêm' : 'Thêm thất bại');
+    msg.className = res.ok ? 'msg success' : 'msg error';
+    if (res.ok) {
+      document.getElementById('newCookie').value = '';
+      toast('Đã thêm tài khoản vào pool', 'success');
+    }
+  } catch (e) {
+    msg.textContent = 'Lỗi kết nối: ' + e.message;
+    msg.className = 'msg error';
+  } finally {
+    btn.disabled = false;
   }
   loadKeys();
 }
 
 async function deleteAccount(key) {
-  if (!confirm('Xoá tài khoản này khỏi pool?')) return;
-  const msg = document.getElementById('listMsg');
-  const res = await fetch('/keys/api/delete', {
-    method: 'POST', headers,
-    body: JSON.stringify({ key })
-  });
-  const data = await res.json();
-  msg.textContent = data.message || data.error;
-  msg.className = res.ok ? 'msg success' : 'msg error';
+  const found = lastKeys.find(function(k) { return k.full === key; });
+  const name = found ? label(found) : 'tài khoản này';
+  let warn = '';
+  if (key === gatewayKey) warn = '\n\nTài khoản này đang là gateway claude.ai.';
+  if (!confirm('Xoá "' + name + '" khỏi pool? Thao tác không thể hoàn tác.' + warn)) return;
+  try {
+    const res = await fetch('/keys/api/delete', {
+      method: 'POST', headers,
+      body: JSON.stringify({ key })
+    });
+    const data = await res.json().catch(function() { return {}; });
+    toast(data.message || data.error || (res.ok ? 'Đã xóa' : 'Xóa thất bại'), res.ok ? 'success' : 'error');
+    if (res.ok && key === gatewayKey) gatewayKey = '';
+  } catch (e) {
+    toast('Lỗi kết nối: ' + e.message, 'error');
+  }
   delete checkResults[key];
   loadKeys();
 }
 
 async function unlockAccount(key) {
-  const msg = document.getElementById('listMsg');
-  const res = await fetch('/keys/api/unlock', {
-    method: 'POST', headers,
-    body: JSON.stringify({ key })
-  });
-  const data = await res.json();
-  msg.textContent = data.message || data.error;
-  msg.className = res.ok ? 'msg success' : 'msg error';
+  try {
+    const res = await fetch('/keys/api/unlock', {
+      method: 'POST', headers,
+      body: JSON.stringify({ key })
+    });
+    const data = await res.json().catch(function() { return {}; });
+    toast(data.message || data.error || (res.ok ? 'Đã mở khóa' : 'Mở khóa thất bại'), res.ok ? 'success' : 'error');
+  } catch (e) {
+    toast('Lỗi kết nối: ' + e.message, 'error');
+  }
   delete checkResults[key];
   loadKeys();
 }
@@ -1205,10 +1473,15 @@ async function loadRecentOnce() {
     if (!res.ok) return;
     const data = await res.json();
     renderRecent(data.requests);
+    updateTokenStat(data.totals);
   } catch (e) { /* dashboard keeps working when the endpoint is unreachable */ }
   const es = new EventSource('/keys/api/recent/stream?apikey=' + encodeURIComponent(API_KEY));
   es.onmessage = function(ev) {
-    try { renderRecent(JSON.parse(ev.data).requests); } catch (e) { /* ignore malformed push */ }
+    try {
+      const d = JSON.parse(ev.data);
+      renderRecent(d.requests);
+      updateTokenStat(d.totals);
+    } catch (e) { /* ignore malformed push */ }
   };
 }
 
@@ -1273,6 +1546,29 @@ async function checkKeys(key) {
   }
 }
 
+function initKeysTable() {
+  const tbody = document.getElementById('keysBody');
+  tbody.addEventListener('click', function(ev) {
+    const btn = ev.target.closest('button[data-act]');
+    if (!btn) return;
+    const key = btn.getAttribute('data-key');
+    const act = btn.getAttribute('data-act');
+    if (act === 'check') checkKeys(key);
+    else if (act === 'unlock') unlockAccount(key);
+    else if (act === 'delete') deleteAccount(key);
+  });
+  tbody.addEventListener('change', function(ev) {
+    const el = ev.target;
+    if (el.name === 'gw') saveGatewayKey(el.getAttribute('data-key'));
+    else if (el.classList.contains('acc-toggle')) toggleAccount(el, el.getAttribute('data-key'));
+  });
+  let tab = 'accounts';
+  try { tab = localStorage.getItem('c2a_tab') || tab; } catch (e) { /* storage blocked */ }
+  if (tab !== 'accounts' && tab !== 'settings' && tab !== 'mcp') tab = 'accounts';
+  showTab(tab);
+}
+
+initKeysTable();
 loadKeys();
 loadTools();
 loadLastImage();
@@ -1281,7 +1577,8 @@ initMCPForm();
 loadPrivacy();
 loadMemory();
 loadRecentOnce();
-setInterval(loadKeys, 3000);
+// Poll only while the tab is visible; the table is rebuilt only when something changed.
+setInterval(function() { if (!document.hidden) loadKeys(); }, 5000);
 setInterval(tickCountdowns, 1000);
 </script>
 </body>

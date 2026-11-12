@@ -532,7 +532,7 @@ func MCPSyncHandler(c *gin.Context) {
 	mcpURL := strings.TrimSpace(body.URL)
 	mcpName := strings.TrimSpace(body.Name)
 	if mcpName == "" {
-		mcpName = "mcp"
+		mcpName = "agent-mcp"
 	}
 	parsedURL, err := url.ParseRequestURI(mcpURL)
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {

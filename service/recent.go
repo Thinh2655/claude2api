@@ -35,6 +35,11 @@ var (
 	recentRecords [recentLimit]recentRequest
 	recentCount   int
 	recentNext    int
+
+	// Running totals since the process started (guarded by recentMu).
+	totalPromptTokens     int64
+	totalCompletionTokens int64
+	totalRequests         int64
 )
 
 // recordRecent appends a finished request to the ring buffer. Called from every
@@ -66,6 +71,9 @@ func recordRecent(c *gin.Context, session *config.SessionInfo, model string, sta
 	if recentCount < recentLimit {
 		recentCount++
 	}
+	totalPromptTokens += int64(pt)
+	totalCompletionTokens += int64(ct)
+	totalRequests++
 	recentMu.Unlock()
 	broadcastRecent()
 }
@@ -81,9 +89,23 @@ func recentSnapshot() []recentRequest {
 	return out
 }
 
+// recentPayload is the JSON body shared by the REST endpoint and the SSE stream:
+// the last few requests plus token totals since the server started.
+func recentPayload() gin.H {
+	requests := recentSnapshot()
+	recentMu.Lock()
+	totals := gin.H{
+		"promptTokens":     totalPromptTokens,
+		"completionTokens": totalCompletionTokens,
+		"requests":         totalRequests,
+	}
+	recentMu.Unlock()
+	return gin.H{"requests": requests, "totals": totals}
+}
+
 // RecentRequestsHandler serves the last few requests for the dashboard.
 func RecentRequestsHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"requests": recentSnapshot()})
+	c.JSON(http.StatusOK, recentPayload())
 }
 
 // recentSubs are the open dashboard streams waiting for a push. Each channel
@@ -123,7 +145,7 @@ func RecentStreamHandler(c *gin.Context) {
 	}()
 
 	send := func() bool {
-		data, err := json.Marshal(gin.H{"requests": recentSnapshot()})
+		data, err := json.Marshal(recentPayload())
 		if err != nil {
 			return true
 		}
