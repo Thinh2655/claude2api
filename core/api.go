@@ -36,6 +36,10 @@ type Client struct {
 	client       *req.Client
 	model        string
 	defaultAttrs map[string]interface{}
+
+	// convID is the upstream conversation currently streaming, so
+	// HandleResponse can ask claude.ai to stop generating on client abort.
+	convID string
 }
 
 // ErrMCPApproval is returned when an MCP tool call pauses upstream waiting for manual approval.
@@ -796,6 +800,7 @@ func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Cont
 	}
 
 	conversationID := newConversationID()
+	c.convID = conversationID
 	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/completion",
 		c.orgID, conversationID)
 
@@ -839,6 +844,7 @@ func newConversationID() string {
 
 // SendMessage sends a message to a conversation and returns the status and response
 func (c *Client) SendMessage(conversationID string, message string, stream bool, gc *gin.Context) (int, error) {
+	c.convID = conversationID
 	if c.orgID == "" {
 		return 500, errors.New("organization ID not set")
 	}
@@ -929,6 +935,19 @@ func textBlockSeparator(prev, next string) string {
 // was already streamed), or an error if it failed early enough to allow a clean retry.
 func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context) error {
 	defer body.Close()
+	// If the API client went away (user pressed Stop / aborted), closing our
+	// side of the connection does not stop claude.ai from generating, so the
+	// reply keeps streaming in the web UI. Ask upstream to stop explicitly.
+	defer func() {
+		if gc.Request.Context().Err() == nil || c.convID == "" {
+			return
+		}
+		if err := c.StopResponse(c.convID); err != nil {
+			logger.Warn("Failed to stop upstream response %s: %v", c.convID, err)
+			return
+		}
+		logger.Info("Stopped upstream response %s after client disconnect", c.convID)
+	}()
 	// Set headers for streaming. The status is intentionally NOT committed
 	// here: writing 200 before reading the first event would lock the response
 	// in even if claude.ai answers with an error event before any content
@@ -1247,6 +1266,39 @@ scan:
 	}
 
 	return nil
+}
+
+// StopResponse asks claude.ai to stop generating the reply of a conversation,
+// like the Stop button in the web UI. Closing the /completion connection is
+// not enough: claude.ai keeps generating server-side and the web UI keeps
+// showing the stream. It uses its own context because the request context is
+// already cancelled when the API client has disconnected.
+func (c *Client) StopResponse(conversationID string) error {
+	if c.orgID == "" || conversationID == "" {
+		return errors.New("organization or conversation ID not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("https://claude.ai/api/organizations/%s/chat_conversations/%s/stop_response",
+		c.orgID, conversationID)
+	resp, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("referer", fmt.Sprintf("https://claude.ai/chat/%s", conversationID)).
+		SetHeader("accept", "application/json").
+		SetBody(map[string]interface{}{}).
+		Post(url)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+		return nil
+	}
+	body := resp.String()
+	if len(body) > 300 {
+		body = body[:300] + "..."
+	}
+	return fmt.Errorf("unexpected status code: %d, response: %s", resp.StatusCode, body)
 }
 
 // DeleteConversation deletes a conversation by ID
