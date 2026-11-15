@@ -70,21 +70,8 @@ func resolveModel(model string) string {
 
 // ChatCompletionsHandler handles the chat completions endpoint
 func ChatCompletionsHandler(c *gin.Context) {
-	slot := c.GetHeader("X-IDE-MCP-Slot")
-	accountIndex := -1
-	if slot != "" {
-		if len(slot) != 2 || slot[0] != 's' || slot[1] < '1' || slot[1] > '3' {
-			c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Invalid IDE MCP slot"})
-			return
-		}
-		accountIndex = int(slot[1] - '1')
-	}
 	useMirror, exist := c.Get("UseMirrorApi")
 	if exist && useMirror.(bool) {
-		if accountIndex >= 0 {
-			c.JSON(http.StatusBadRequest, ErrorResponse{Error: "IDE MCP slots require a pooled account"})
-			return
-		}
 		MirrorChatHandler(c)
 		return
 	}
@@ -119,20 +106,7 @@ func ChatCompletionsHandler(c *gin.Context) {
 	config.ConfigInstance.RwMutx.RLock()
 	sessions := append([]config.SessionInfo(nil), config.ConfigInstance.Sessions...)
 	config.ConfigInstance.RwMutx.RUnlock()
-	var order []int
-	if accountIndex >= 0 {
-		if accountIndex >= len(sessions) || sessions[accountIndex].Disabled {
-			c.JSON(http.StatusServiceUnavailable, ErrorResponse{Error: "No enabled account for IDE MCP slot " + slot})
-			return
-		}
-		if _, _, _, limited := config.SessionLimited(sessions[accountIndex].SessionKey); limited {
-			c.JSON(http.StatusTooManyRequests, ErrorResponse{Error: "The account for IDE MCP slot " + slot + " is rate limited"})
-			return
-		}
-		order = []int{accountIndex}
-	} else {
-		order = roundRobinOrder(sessions, config.Sr.NextIndex(len(sessions)))
-	}
+	order := roundRobinOrder(sessions, config.Sr.NextIndex(len(sessions)))
 
 	var lastStatus int
 	var lastErrMsg string
@@ -193,9 +167,7 @@ func ChatCompletionsHandler(c *gin.Context) {
 			// instead of wasting time on a session that just rate-limited.
 			config.CooldownSession(session.SessionKey)
 		}
-		if accountIndex < 0 {
-			logger.Info("Retrying another session")
-		}
+		logger.Info("Retrying another session")
 	}
 
 	if busyAccounts > 0 && busyAccounts == len(order) {
@@ -232,9 +204,6 @@ func ChatCompletionsHandler(c *gin.Context) {
 		finalStatus = lastStatus
 		finalMsg = "Upstream claude.ai is unavailable: " + http.StatusText(lastStatus)
 	}
-	if accountIndex >= 0 && lastErrMsg != "" {
-		finalMsg = lastErrMsg
-	}
 	c.JSON(finalStatus, ErrorResponse{Error: finalMsg})
 }
 
@@ -243,10 +212,6 @@ func MirrorChatHandler(c *gin.Context) {
 		c.JSON(http.StatusForbidden, ErrorResponse{
 			Error: "Mirror API is not enabled",
 		})
-		return
-	}
-	if c.GetHeader("X-IDE-MCP-Slot") != "" {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "IDE MCP slots require a pooled account"})
 		return
 	}
 
@@ -481,10 +446,6 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	clientToolsEnabled, builtinTools := config.ConfigInstance.ToolSettings()
 	v, _ := c.Get("ChatTools")
 	tools, _ := v.([]map[string]interface{})
-	slot := c.GetHeader("X-IDE-MCP-Slot")
-	if slot != "" {
-		clientToolsEnabled = true
-	}
 	if clientToolsEnabled {
 		// Describe client functions in the prompt so the model can return a
 		// toolcall block. Claude's built-in tools go in the upstream tool list.
@@ -506,16 +467,7 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 	}
 
 	claudeClient.SetOrgID(session.OrgID)
-	if slot == "" {
-		claudeClient.AttachMCPTools()
-	} else {
-		// IDE calls tools from the completion stream with its own turn identity.
-		// A remote callback to a fixed URL cannot identify a reused turn.
-		if err := claudeClient.CheckMCPSlot(slot); err != nil {
-			return fail(http.StatusServiceUnavailable, "IDE MCP slot "+slot+": "+err.Error())
-		}
-		c.Header("X-IDE-MCP-Slot", slot)
-	}
+	claudeClient.AttachMCPTools()
 
 	// Upload images if any
 	if len(processor.ImgDataList) > 0 {

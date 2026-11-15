@@ -39,24 +39,3 @@ func TestMCPSyncSlotOptIn(t *testing.T) {
 		})
 	}
 }
-
-func TestChatCompletionSlotDoesNotFallBack(t *testing.T) {
-	previous := config.ConfigInstance
-	config.ConfigInstance = &config.Config{Sessions: []config.SessionInfo{
-		{SessionKey: "disabled", Disabled: true},
-		*config.NewSessionInfo("other-account", "other-org"),
-	}}
-	t.Cleanup(func() { config.ConfigInstance = previous })
-	router := gin.New()
-	router.POST("/v1/chat/completions", ChatCompletionsHandler)
-	for _, slot := range []string{"s1", "s3"} {
-		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("X-IDE-MCP-Slot", slot)
-		response := httptest.NewRecorder()
-		router.ServeHTTP(response, request)
-		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "No enabled account for IDE MCP slot "+slot) {
-			t.Fatalf("slot %s: got %d %s", slot, response.Code, response.Body.String())
-		}
-	}
-}

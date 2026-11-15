@@ -907,21 +907,6 @@ func (c *Client) fetchRemoteServerConnection(orgID, uuid string) (*remoteMCPConn
 	return nil, nil
 }
 
-// CheckMCPSlot checks the configured connector before serving an IDE slot.
-func (c *Client) CheckMCPSlot(slot string) error {
-	servers, err := c.listRemoteServers(c.orgID)
-	if err != nil {
-		return err
-	}
-	for _, server := range servers {
-		endpoint, err := url.Parse(server.URL)
-		if err == nil && server.UUID != "" && strings.HasSuffix(strings.TrimRight(endpoint.Path, "/"), "/mcp/"+slot) {
-			return nil
-		}
-	}
-	return errors.New("account has no matching connector; sync MCP slots again on the dashboard")
-}
-
 // listRemoteServers returns the custom remote MCP servers configured on the
 // account's organization.
 func (c *Client) listRemoteServers(orgID string) ([]remoteMCPServer, error) {
