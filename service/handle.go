@@ -425,31 +425,18 @@ func handleChatRequest(c *gin.Context, session *config.SessionInfo, model string
 		return status, false, msg
 	}
 
-	// Function-calling shim: the web backend has no tools API, so client tool
-	// results come back as role=tool text and client function tools are
-	// described in the prompt (the model answers with a ```toolcall block).
-	if config.ConfigInstance.ToolsEnabled() {
-		if v, ok := c.Get("ChatTools"); ok {
-			if tools, ok := v.([]map[string]interface{}); ok && len(tools) > 0 {
-				if p := core.ToolPrompt(tools); p != "" {
-					processor.Prompt.WriteString(p)
-				}
-			}
-		}
-	}
-
-	// Initialize the Claude client
 	claudeClient := core.NewClientWithCookie(session.SessionKey, config.ConfigInstance.Proxy, model, session.ExtraCookie, session.DeviceID)
-	// Forward client-requested tools (web_search, artifacts, repl/code_interpreter)
-	// to the upstream tool list; unknown function tools are dropped since the
-	// web backend can't execute arbitrary functions.
-	if config.ConfigInstance.ToolsEnabled() {
-		if v, ok := c.Get("ChatTools"); ok {
-			if tools, ok := v.([]map[string]interface{}); ok {
-				claudeClient.SetTools(tools)
-			}
+	clientToolsEnabled, builtinTools := config.ConfigInstance.ToolSettings()
+	v, _ := c.Get("ChatTools")
+	tools, _ := v.([]map[string]interface{})
+	if clientToolsEnabled {
+		// Describe client functions in the prompt so the model can return a
+		// toolcall block. Claude's built-in tools go in the upstream tool list.
+		if p := core.ToolPrompt(tools); p != "" {
+			processor.Prompt.WriteString(p)
 		}
 	}
+	claudeClient.SetTools(tools, clientToolsEnabled, builtinTools)
 
 	// Get org ID if not already set
 	if session.OrgID == "" {

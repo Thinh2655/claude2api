@@ -209,11 +209,41 @@ const keysPageHTML = `<!DOCTYPE html>
     <h2>Cài đặt</h2>
     <div class="switch-row">
       <div>
-        <div>Hỗ trợ tool (function-calling)</div>
-        <div class="hint">Forward tool client gửi lên model và trả <code>tool_calls</code> chuẩn OpenAI. Tắt = bỏ qua mọi tool trong request.</div>
+        <div id="toolsLabel">Function calling phía client</div>
+        <div class="hint">Cho API nhận các hàm do client khai báo và trả lời bằng <code>tool_calls</code>.</div>
       </div>
       <label class="switch">
-        <input type="checkbox" id="toolsToggle" onchange="saveTools(this)">
+        <input type="checkbox" id="toolsToggle" aria-labelledby="toolsLabel" onchange="saveTools(this)" disabled>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row" style="margin-top:1rem;">
+      <div>
+        <div id="webSearchLabel">Tìm kiếm web (web_search)</div>
+        <div class="hint">Cho Claude tìm và đọc thông tin trên Internet.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" data-builtin-tool="web_search" aria-labelledby="webSearchLabel" onchange="saveTools(this)" disabled>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row" style="margin-top:1rem;">
+      <div>
+        <div id="artifactsLabel">Artifacts</div>
+        <div class="hint">Cho Claude tạo nội dung như trang HTML hoặc ứng dụng tương tác.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" data-builtin-tool="artifacts" aria-labelledby="artifactsLabel" onchange="saveTools(this)" disabled>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-row" style="margin-top:1rem;">
+      <div>
+        <div id="replLabel">Chạy mã (REPL)</div>
+        <div class="hint">Cho Claude chạy mã để tính toán hoặc xử lý dữ liệu.</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" data-builtin-tool="repl" aria-labelledby="replLabel" onchange="saveTools(this)" disabled>
         <span class="slider"></span>
       </label>
     </div>
@@ -619,17 +649,28 @@ function cssEscape(s) { return s.replace(/"/g, '\\"'); }
 async function loadTools() {
   const res = await fetch('/keys/api/tools', { headers });
   if (!res.ok) return;
-  const data = await res.json();
+  showToolSettings(await res.json());
+}
+
+const toolToggles = document.querySelectorAll('#toolsToggle, [data-builtin-tool]');
+
+function showToolSettings(data) {
   document.getElementById('toolsToggle').checked = !!data.enableTools;
+  toolToggles.forEach(function(toggle) {
+    if (toggle.dataset.builtinTool) {
+      toggle.checked = !!data.builtinTools[toggle.dataset.builtinTool];
+    }
+    toggle.disabled = false;
+  });
 }
 
 async function saveTools(el) {
   const msg = document.getElementById('toolsMsg');
-  el.disabled = true;
+  toolToggles.forEach(function(toggle) { toggle.disabled = true; });
   try {
     const res = await fetch('/keys/api/tools', {
       method: 'POST', headers,
-      body: JSON.stringify({ enabled: el.checked })
+      body: JSON.stringify({ tool: el.dataset.builtinTool, enabled: el.checked })
     });
     const data = await res.json();
     if (!res.ok) {
@@ -638,14 +679,15 @@ async function saveTools(el) {
       msg.className = 'msg error';
       return;
     }
-    msg.textContent = 'Đã ' + (data.enableTools ? 'bật' : 'tắt') + ' hỗ trợ tool';
+    showToolSettings(data);
+    msg.textContent = 'Đã lưu cài đặt tool.';
     msg.className = 'msg success';
   } catch (e) {
     el.checked = !el.checked;
     msg.textContent = 'Lỗi kết nối: ' + e.message;
     msg.className = 'msg error';
   } finally {
-    el.disabled = false;
+    toolToggles.forEach(function(toggle) { toggle.disabled = false; });
   }
 }
 

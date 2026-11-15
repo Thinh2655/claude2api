@@ -213,18 +213,20 @@ func ExtractToolCalls(text string) (string, []ToolCall) {
 	return strings.TrimSpace(cleaned), calls
 }
 
-func ResponseWithTools(text string, reasoning string, stream bool, gc *gin.Context) error {
-	cleaned, calls := ExtractToolCalls(text)
-	if len(calls) == 0 {
-		if stream {
-			return streamRespose(text, gc)
+func ResponseWithTools(text string, reasoning string, stream, toolsEnabled bool, gc *gin.Context) error {
+	if toolsEnabled {
+		cleaned, calls := ExtractToolCalls(text)
+		if len(calls) > 0 {
+			if stream {
+				return streamToolResponse(cleaned, calls, gc)
+			}
+			return noStreamToolResponseWithReasoning(cleaned, reasoning, calls, gc)
 		}
-		return noStreamResponseWithReasoning(text, reasoning, gc)
 	}
 	if stream {
-		return streamToolResponse(cleaned, calls, gc)
+		return streamRespose(text, gc)
 	}
-	return noStreamToolResponseWithReasoning(cleaned, reasoning, calls, gc)
+	return noStreamResponseWithReasoning(text, reasoning, gc)
 }
 
 func noStreamToolResponseWithReasoning(text string, reasoning string, calls []ToolCall, gc *gin.Context) error {
@@ -302,14 +304,15 @@ func streamToolResponse(text string, calls []ToolCall, gc *gin.Context) error {
 // leading ```toolcall block so it can be emitted as a tool_calls chunk at the
 // end instead of leaking the raw JSON as content.
 type StreamToolFilter struct {
-	pending strings.Builder
-	state   int // 0 = undecided, 1 = normal text, 2 = toolcall block
+	Disabled bool
+	pending  strings.Builder
+	state    int // 0 = undecided, 1 = normal text, 2 = toolcall block
 }
 
 const toolCallFence = "```toolcall"
 
 func (f *StreamToolFilter) Feed(text string, stream bool, gc *gin.Context) {
-	if !stream || f.state == 1 {
+	if f.Disabled || !stream || f.state == 1 {
 		ReturnOpenAIResponse(text, stream, gc)
 		return
 	}

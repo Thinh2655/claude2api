@@ -235,27 +235,47 @@ func GatewayKeySetHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Gateway key updated"})
 }
 
-// ToolsGetHandler returns whether tool support is enabled
+// ToolsGetHandler returns the client function calling and built-in tool settings.
 func ToolsGetHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"enableTools": config.ConfigInstance.ToolsEnabled()})
+	enabled, builtin := config.ConfigInstance.ToolSettings()
+	c.JSON(http.StatusOK, gin.H{"enableTools": enabled, "builtinTools": builtin})
 }
 
-// ToolsSetHandler toggles tool support and persists it to .env
+// ToolsSetHandler changes one tool setting and persists it to .env.
 func ToolsSetHandler(c *gin.Context) {
 	var body struct {
-		Enabled bool `json:"enabled"`
+		Tool    string `json:"tool"`
+		Enabled *bool  `json:"enabled"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
+	if err := c.ShouldBindJSON(&body); err != nil || body.Enabled == nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Provide {\"enabled\": true|false}"})
 		return
 	}
-	config.ConfigInstance.RwMutx.Lock()
-	config.ConfigInstance.EnableTools = body.Enabled
-	config.ConfigInstance.RwMutx.Unlock()
-	if err := saveEnvLine("ENABLE_TOOLS", fmt.Sprintf("%t", body.Enabled)); err != nil {
-		logger.Error("Failed to persist ENABLE_TOOLS to .env: %v", err)
+	cfg := config.ConfigInstance
+	envName := "ENABLE_CLIENT_TOOLS"
+	if body.Tool != "" {
+		_, builtin := cfg.ToolSettings()
+		if _, ok := builtin[body.Tool]; !ok {
+			c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Unknown built-in tool"})
+			return
+		}
+		envName = "ENABLE_" + strings.ToUpper(body.Tool)
 	}
-	c.JSON(http.StatusOK, gin.H{"enableTools": body.Enabled})
+
+	cfg.RwMutx.Lock()
+	if err := saveEnvLine(envName, fmt.Sprintf("%t", *body.Enabled)); err != nil {
+		cfg.RwMutx.Unlock()
+		logger.Error("Failed to persist %s to .env: %v", envName, err)
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Không lưu được cài đặt tool"})
+		return
+	}
+	if body.Tool == "" {
+		cfg.EnableTools = *body.Enabled
+	} else {
+		cfg.BuiltinTools[body.Tool] = *body.Enabled
+	}
+	cfg.RwMutx.Unlock()
+	ToolsGetHandler(c)
 }
 
 // MCPGetHandler returns whether MCP tool support is enabled, plus the stored
@@ -854,6 +874,9 @@ func saveEnvLine(name, value string) error {
 			lines = append(lines, text)
 		}
 		f.Close()
+		if err := scanner.Err(); err != nil {
+			return err
+		}
 	} else if !os.IsNotExist(err) {
 		return err
 	}

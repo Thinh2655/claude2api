@@ -81,9 +81,9 @@ type Config struct {
 	PromptDisableArtifacts bool          `yaml:"promptDisableArtifacts"`
 	EnableMirrorApi        bool          `yaml:"enableMirrorApi"`
 	MirrorApiPrefix        string        `yaml:"mirrorApiPrefix"`
-	// EnableTools forwards client-requested tools to the model (web_search,
-	// artifacts, repl) and exposes client function tools as OpenAI tool_calls.
-	EnableTools bool `yaml:"enableTools"`
+	// EnableTools controls client function calls.
+	EnableTools  bool            `yaml:"enableTools"`
+	BuiltinTools map[string]bool `yaml:"builtinTools"`
 	// OnlyLastImage drops image_url parts from every message except the last
 	// one, so long histories don't re-upload old images on each request.
 	OnlyLastImage bool `yaml:"onlyLastImage"`
@@ -135,11 +135,33 @@ func (c *Config) GetSessionForModel(idx int) (*SessionInfo, error) {
 	return &c.Sessions[idx], nil
 }
 
-// ToolsEnabled reports whether tool support is on (safe under the config lock).
-func (c *Config) ToolsEnabled() bool {
+var builtinToolNames = [...]string{"web_search", "artifacts", "repl"}
+
+// ToolSettings returns a snapshot for the API and settings dashboard.
+func (c *Config) ToolSettings() (bool, map[string]bool) {
 	c.RwMutx.RLock()
 	defer c.RwMutx.RUnlock()
-	return c.EnableTools
+	builtin := make(map[string]bool, len(builtinToolNames))
+	for _, name := range builtinToolNames {
+		builtin[name] = c.BuiltinTools[name]
+	}
+	return c.EnableTools, builtin
+}
+
+func (c *Config) applyToolEnvOverrides() {
+	if c.BuiltinTools == nil {
+		c.BuiltinTools = make(map[string]bool)
+	}
+	for _, name := range builtinToolNames {
+		if enabled, err := strconv.ParseBool(os.Getenv("ENABLE_" + strings.ToUpper(name))); err == nil {
+			c.BuiltinTools[name] = enabled
+		} else if _, configured := c.BuiltinTools[name]; !configured {
+			c.BuiltinTools[name] = c.EnableTools
+		}
+	}
+	if enabled, err := strconv.ParseBool(os.Getenv("ENABLE_CLIENT_TOOLS")); err == nil {
+		c.EnableTools = enabled
+	}
 }
 
 // OnlyLastImageEnabled reports whether only the last message's images are
@@ -780,8 +802,7 @@ func loadConfigFromEnv() *Config {
 		MirrorApiPrefix: os.Getenv("MIRROR_API_PREFIX"),
 		// 设置是否启用网关（本地模拟 claude.ai 网页）
 		EnableGateway: os.Getenv("ENABLE_GATEWAY") == "true",
-		// Bật/tắt hỗ trợ tool (mặc định bật)
-		EnableTools: os.Getenv("ENABLE_TOOLS") != "false",
+		EnableTools:   os.Getenv("ENABLE_TOOLS") != "false",
 		// Chỉ nhận ảnh ở message cuối (mặc định tắt = giữ hành vi cũ)
 		OnlyLastImage: os.Getenv("ONLY_LAST_IMAGE") == "true",
 		// Hỗ trợ MCP tools
@@ -810,6 +831,7 @@ func loadConfigFromEnv() *Config {
 		config.Address = "0.0.0.0:8080"
 	}
 	config.sanitizeMCPToolPermissions()
+	config.applyToolEnvOverrides()
 	return config
 }
 
@@ -821,6 +843,7 @@ func LoadConfig() *Config {
 		logger.Info("Found config file at %s", configPath)
 		config, err := loadConfigFromYAML(configPath)
 		if err == nil {
+			config.applyToolEnvOverrides()
 			logger.Info("Successfully loaded configuration from YAML file")
 			return config
 		}

@@ -1,6 +1,17 @@
 package core
 
-import "testing"
+import (
+	"fmt"
+	"io"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"claude2api/config"
+
+	"github.com/gin-gonic/gin"
+)
 
 func TestUpstreamTool(t *testing.T) {
 	cases := []struct {
@@ -32,6 +43,55 @@ func TestUpstreamTool(t *testing.T) {
 	if got := resolveUpstreamTools([]map[string]interface{}{{"name": "web_search"}}, defs); len(got) != 1 {
 		t.Fatal("explicit web_search must be kept")
 	}
+}
+
+func TestDisableToolsKeepsOnlyMCP(t *testing.T) {
+	mcpEnabled := config.ConfigInstance.EnableMCP
+	config.ConfigInstance.EnableMCP = true
+	org := t.Name()
+	mcpCache[org] = mcpCacheEntry{
+		tools:     []map[string]interface{}{{"name": "lookup", "mcp_server_uuid": "remote"}},
+		expiresAt: time.Now().Add(time.Minute),
+	}
+	t.Cleanup(func() {
+		config.ConfigInstance.EnableMCP = mcpEnabled
+		delete(mcpCache, org)
+	})
+
+	client := NewClient("test-session", "", "")
+	client.SetOrgID(org)
+	builtin := map[string]bool{"web_search": false, "artifacts": false, "repl": false}
+	client.SetTools(nil, false, builtin)
+	assertJSONEqual(t, client.defaultAttrs["tools"], `[]`)
+	client.AttachMCPTools()
+	assertJSONEqual(t, client.defaultAttrs["tools"], `[{"name":"lookup","mcp_server_uuid":"remote"}]`)
+
+	const toolCall = "```toolcall {\"name\":\"client_function\"}```"
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			event := fmt.Sprintf(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":%q}}`+"\n\n", toolCall)
+			if err := client.HandleResponse(io.NopCloser(strings.NewReader(event)), stream, ctx); err != nil {
+				t.Fatal(err)
+			}
+			if body := recorder.Body.String(); strings.Contains(body, `"tool_calls"`) || !strings.Contains(body, "```toolcall") {
+				t.Fatalf("expected toolcall fence as text, got %s", body)
+			}
+		})
+	}
+}
+
+func TestBuiltinToolsCanBeToggledIndependently(t *testing.T) {
+	builtin := map[string]bool{"web_search": true, "artifacts": false, "repl": false}
+	client := NewClient("test-session", "", "")
+	client.SetTools(nil, false, builtin)
+	assertJSONEqual(t, client.defaultAttrs["tools"], `[{"type":"web_search_v0","name":"web_search"}]`)
+
+	client = NewClient("test-session", "", "")
+	client.SetTools([]map[string]interface{}{{"name": "websearch"}, {"name": "artifact"}, {"name": "code_interpreter"}}, true, builtin)
+	assertJSONEqual(t, client.defaultAttrs["tools"], `[{"type":"web_search_v0","name":"web_search"}]`)
 }
 
 func TestDetectToolLanguage(t *testing.T) {

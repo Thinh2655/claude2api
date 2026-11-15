@@ -31,11 +31,12 @@ import (
 )
 
 type Client struct {
-	SessionKey   string
-	orgID        string
-	client       *req.Client
-	model        string
-	defaultAttrs map[string]interface{}
+	SessionKey    string
+	orgID         string
+	client        *req.Client
+	model         string
+	defaultAttrs  map[string]interface{}
+	toolsDisabled bool
 
 	// convID is the upstream conversation currently streaming, so
 	// HandleResponse can ask claude.ai to stop generating on client abort.
@@ -637,16 +638,23 @@ func NewClientWithCookie(sessionKey string, proxy string, model string, cookie s
 	return c
 }
 
-// SetTools overrides the default upstream tool list with the client-requested
-// one. Empty input keeps the defaults; a non-empty list sends only the mapped
-// tools (possibly none), so custom function tools don't drag along Claude's
-// default web_search/artifacts/repl.
-func (c *Client) SetTools(clientTools []map[string]interface{}) {
-	if len(clientTools) == 0 {
-		return
+// SetTools resolves the requested or default tools and applies the built-in
+// tool settings before AttachMCPTools adds the account's MCP tools.
+func (c *Client) SetTools(clientTools []map[string]interface{}, clientToolsEnabled bool, builtinTools map[string]bool) {
+	c.toolsDisabled = !clientToolsEnabled
+	if c.toolsDisabled {
+		clientTools = nil
 	}
 	defaults, _ := c.defaultAttrs["tools"].([]map[string]interface{})
-	c.defaultAttrs["tools"] = resolveUpstreamTools(clientTools, defaults)
+	tools := resolveUpstreamTools(clientTools, defaults)
+	allowed := make([]map[string]interface{}, 0, len(tools))
+	for _, tool := range tools {
+		kind, _ := tool["type"].(string)
+		if enabled, builtin := builtinTools[strings.TrimSuffix(kind, "_v0")]; !builtin || enabled {
+			allowed = append(allowed, tool)
+		}
+	}
+	c.defaultAttrs["tools"] = allowed
 }
 
 // SetOrgID sets the organization ID for the client
@@ -992,7 +1000,7 @@ func (c *Client) HandleResponse(body io.ReadCloser, stream bool, gc *gin.Context
 	languageStr := "md"
 	// Holds back a leading ```toolcall block so it streams as tool_calls, not
 	// raw JSON content.
-	toolFilter := &model.StreamToolFilter{}
+	toolFilter := &model.StreamToolFilter{Disabled: c.toolsDisabled}
 	// pendingJSON accumulates a tool_use input_json_delta object until it parses
 	// as a complete JSON object, so we can extract the code field intact.
 	pendingJSON := ""
@@ -1255,7 +1263,7 @@ scan:
 		logger.Warn("Upstream sent no usable content (stream=%t), event types: %v", stream, seenTypes)
 	}
 	if !stream {
-		model.ResponseWithTools(res_all_text, res_reasoning_text, stream, gc)
+		model.ResponseWithTools(res_all_text, res_reasoning_text, stream, !c.toolsDisabled, gc)
 	} else {
 		// Flush any held-back text/toolcall block, then the end marker.
 		if !filterFinished {
