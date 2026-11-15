@@ -530,16 +530,17 @@ func memoryVerifyMessage(want bool, got *bool) (string, bool) {
 	return fmt.Sprintf("đã gửi, chưa xác nhận: enabled_saffron=%t", *got), false
 }
 
-// MCPSyncHandler synchronizes all accounts with a new remote MCP server URL.
+// MCPSyncHandler synchronizes a shared endpoint or assigns slots in pool order.
 func MCPSyncHandler(c *gin.Context) {
 	var body struct {
-		Name         string           `json:"name"`
-		URL          string           `json:"url"`
-		AuthMode     string           `json:"authMode"`
-		Registration string           `json:"registration"`
-		ClientID     string           `json:"clientId"`
-		ClientSecret string           `json:"clientSecret"`
-		Headers      []core.MCPHeader `json:"headers"`
+		Name            string           `json:"name"`
+		URL             string           `json:"url"`
+		PerAccountSlots bool             `json:"perAccountSlots"`
+		AuthMode        string           `json:"authMode"`
+		Registration    string           `json:"registration"`
+		ClientID        string           `json:"clientId"`
+		ClientSecret    string           `json:"clientSecret"`
+		Headers         []core.MCPHeader `json:"headers"`
 		// ToolMode / ToolModes are optional: default permission of every tool
 		// and per-tool overrides. Omitted fields keep the stored values.
 		ToolMode  string            `json:"toolMode"`
@@ -549,14 +550,18 @@ func MCPSyncHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Dữ liệu JSON không hợp lệ"})
 		return
 	}
-	mcpURL := strings.TrimSpace(body.URL)
 	mcpName := strings.TrimSpace(body.Name)
 	if mcpName == "" {
 		mcpName = "agent-mcp"
 	}
-	parsedURL, err := url.ParseRequestURI(mcpURL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+	mcpURL := strings.TrimSpace(body.URL)
+	baseURL, err := url.ParseRequestURI(mcpURL)
+	if err != nil || (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "URL MCP không hợp lệ (phải bắt đầu bằng http:// hoặc https://)"})
+		return
+	}
+	if body.PerAccountSlots && (strings.Contains(mcpURL, "#") || !strings.HasSuffix(strings.TrimRight(baseURL.Path, "/"), "/mcp")) {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "Khi tự gán slot, nhập URL gốc có đường dẫn kết thúc bằng /mcp và không có fragment (#)"})
 		return
 	}
 
@@ -616,17 +621,25 @@ func MCPSyncHandler(c *gin.Context) {
 			defer func() { <-sem }()
 
 			label := displayLabel(&sess)
+			targetURL := mcpURL
+			slot := ""
+			if body.PerAccountSlots {
+				slot = fmt.Sprintf("s%d", idx+1)
+				targetURL = baseURL.JoinPath(slot).String()
+			}
 			client := core.NewClientWithCookie(sess.SessionKey, config.ConfigInstance.Proxy, "", sess.ExtraCookie, sess.DeviceID)
-			res, syncErr := client.SyncRemoteMCP(mcpName, mcpURL, install, perms)
+			res, syncErr := client.SyncRemoteMCP(mcpName, targetURL, install, perms)
 			if syncErr != nil {
 				results[idx] = core.SyncMCPResult{
 					Account: label,
+					Slot:    slot,
 					Status:  "error",
 					Message: syncErr.Error(),
 				}
 				logger.Warn("MCP sync failed for account %s: %v", label, syncErr)
 			} else {
 				res.Account = label
+				res.Slot = slot
 				results[idx] = *res
 				logger.Info("MCP sync succeeded for account %s: %s", label, res.Message)
 			}

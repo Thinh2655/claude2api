@@ -707,7 +707,12 @@ type AccountInfo struct {
 // GetAccountEmail calls /api/account and returns the account's email address.
 // Used as the human-readable display name when a cookie account has no label.
 func (c *Client) GetAccountEmail() (string, error) {
+	return c.getAccountEmail(context.Background())
+}
+
+func (c *Client) getAccountEmail(ctx context.Context) (string, error) {
 	resp, err := c.client.R().
+		SetContext(ctx).
 		SetHeader("referer", "https://claude.ai/").
 		SetHeader("accept", "application/json").
 		Get("https://claude.ai/api/account")
@@ -721,7 +726,7 @@ func (c *Client) GetAccountEmail() (string, error) {
 	if err := json.Unmarshal(resp.Bytes(), &acct); err != nil {
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
-	if acct.EmailAddress == "" {
+	if strings.TrimSpace(acct.EmailAddress) == "" {
 		return "", errors.New("no email_address in account response")
 	}
 	return acct.EmailAddress, nil
@@ -823,6 +828,11 @@ func (c *Client) SendMessageWithCreate(message string, stream bool, gc *gin.Cont
 	}
 	resp, err := reqBuilder.Post(url)
 	if err != nil {
+		if gc != nil && gc.Request.Context().Err() != nil {
+			if stopErr := c.StopResponse(conversationID); stopErr != nil {
+				logger.Warn("Failed to stop upstream response %s: %v", conversationID, stopErr)
+			}
+		}
 		return "", 500, fmt.Errorf("request failed: %w", err)
 	}
 	logger.Info("Claude response status code: %d", resp.StatusCode)

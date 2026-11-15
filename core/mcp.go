@@ -315,6 +315,7 @@ func truncateText(s string, maxRunes int) string {
 // SyncMCPResult holds the outcome of an MCP sync/delete operation for an account.
 type SyncMCPResult struct {
 	Account   string `json:"account"`
+	Slot      string `json:"slot,omitempty"`
 	Status    string `json:"status"` // "ok", "warning" or "error"
 	Message   string `json:"message"`
 	Deleted   int    `json:"deleted"`
@@ -904,6 +905,21 @@ func (c *Client) fetchRemoteServerConnection(orgID, uuid string) (*remoteMCPConn
 		}
 	}
 	return nil, nil
+}
+
+// CheckMCPSlot checks the configured connector before serving an IDE slot.
+func (c *Client) CheckMCPSlot(slot string) error {
+	servers, err := c.listRemoteServers(c.orgID)
+	if err != nil {
+		return err
+	}
+	for _, server := range servers {
+		endpoint, err := url.Parse(server.URL)
+		if err == nil && server.UUID != "" && strings.HasSuffix(strings.TrimRight(endpoint.Path, "/"), "/mcp/"+slot) {
+			return nil
+		}
+	}
+	return errors.New("account has no matching connector; sync MCP slots again on the dashboard")
 }
 
 // listRemoteServers returns the custom remote MCP servers configured on the

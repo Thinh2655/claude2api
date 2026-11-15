@@ -35,24 +35,10 @@ type SessionInfo struct {
 	// DeviceID mirrors the browser anthropic-device-id cookie when using a
 	// cookie file, so upstream sees the same device as the real browser.
 	DeviceID string `yaml:"deviceId,omitempty"`
-	// mu serializes requests on one session: concurrent requests would
-	// otherwise overwrite each other's paprika_mode (think mode) settings.
-	// Pointer so that SessionInfo copies share the same lock.
-	mu *sync.Mutex `yaml:"-"`
 }
 
-func (s *SessionInfo) LockSession() {
-	s.mu.Lock()
-}
-
-func (s *SessionInfo) UnlockSession() {
-	s.mu.Unlock()
-}
-
-// NewSessionInfo creates a SessionInfo with an initialized lock, for sessions
-// that are not loaded from config (e.g. extracted from request headers)
 func NewSessionInfo(sessionKey, orgID string) *SessionInfo {
-	return &SessionInfo{SessionKey: sessionKey, OrgID: orgID, mu: &sync.Mutex{}}
+	return &SessionInfo{SessionKey: sessionKey, OrgID: orgID}
 }
 
 // NewSessionInfoWithCookie is NewSessionInfo with an optional Cookie header,
@@ -598,12 +584,15 @@ func ClearLimits() {
 	limitMu.Unlock()
 }
 
-func (sr *SessionRagen) NextIndex() int {
+func (sr *SessionRagen) NextIndex(count int) int {
+	if count == 0 {
+		return 0
+	}
 	sr.Mutex.Lock()
 	defer sr.Mutex.Unlock()
 
-	index := sr.Index
-	sr.Index = (index + 1) % len(ConfigInstance.Sessions)
+	index := sr.Index % count
+	sr.Index = (index + 1) % count
 	return index
 }
 
@@ -650,9 +639,6 @@ func loadConfigFromYAML(configPath string) (*Config, error) {
 
 	// 设置读写锁（不从YAML加载）
 	config.RwMutx = sync.RWMutex{}
-	for i := range config.Sessions {
-		config.Sessions[i].mu = &sync.Mutex{}
-	}
 
 	// 如果地址为空，使用默认值
 	if config.Address == "" {
@@ -821,9 +807,6 @@ func loadConfigFromEnv() *Config {
 		GatewayKey: os.Getenv("GATEWAY_KEY"),
 		// 设置读写锁
 		RwMutx: sync.RWMutex{},
-	}
-	for i := range config.Sessions {
-		config.Sessions[i].mu = &sync.Mutex{}
 	}
 
 	// 如果地址为空，使用默认值

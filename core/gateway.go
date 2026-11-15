@@ -3,6 +3,9 @@ package core
 import (
 	"claude2api/config"
 	"claude2api/logger"
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -33,7 +36,36 @@ type gatewayHandler struct {
 	proxy *httputil.ReverseProxy
 }
 
+type gatewayCompletionSession struct{}
+
 func (h *gatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if r.Method == http.MethodPost && len(parts) == 6 && parts[0] == "api" && parts[1] == "organizations" && parts[3] == "chat_conversations" && (parts[5] == "completion" || parts[5] == "retry_completion") {
+		session := gatewaySession(r)
+		client := NewClientWithCookie(session.SessionKey, config.ConfigInstance.Proxy, "", session.ExtraCookie, session.DeviceID)
+		release, err := client.TryStartCompletion(r.Context())
+		if err != nil {
+			message := "Could not verify Claude account"
+			if errors.Is(err, ErrAccountBusy) {
+				w.Header().Set("Retry-After", "1")
+				message = ErrAccountBusy.Error()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+			return
+		}
+		defer release()
+		defer func() {
+			if r.Context().Err() != nil {
+				client.SetOrgID(parts[2])
+				if err := client.StopResponse(parts[4]); err != nil {
+					logger.Warn("Could not stop gateway completion: %v", err)
+				}
+			}
+		}()
+		r = r.WithContext(context.WithValue(r.Context(), gatewayCompletionSession{}, session))
+	}
 	h.proxy.ServeHTTP(w, r)
 }
 
@@ -54,9 +86,6 @@ func NewGatewayHandler() http.Handler {
 		origDirector(req)
 		req.Host = "claude.ai"
 		gatewayRewriteRequest(req)
-		if strings.Contains(req.URL.Path, "/completion") {
-			logger.Info("gateway completion %s — headers: %v", req.URL.Path, req.Header)
-		}
 	}
 	h.proxy.ModifyResponse = gatewayModifyResponse
 	h.proxy.FlushInterval = 100 * time.Millisecond // stream SSE promptly
@@ -73,8 +102,7 @@ func NewGatewayHandler() http.Handler {
 // proxied web UI reaches claude.ai with the same cookie state the real browser
 // uses when no account is pinned;
 // (3) the first pool session.
-func pickSession() config.SessionInfo {
-	sessions := config.ConfigInstance.Sessions
+func pickSession(sessions []config.SessionInfo, gatewayKey string) config.SessionInfo {
 	if len(sessions) == 0 {
 		return config.SessionInfo{}
 	}
@@ -87,9 +115,9 @@ func pickSession() config.SessionInfo {
 		}
 		return true
 	}
-	if gw := config.ConfigInstance.GetGatewayKey(); gw != "" {
+	if gatewayKey != "" {
 		for i := range sessions {
-			if sessions[i].SessionKey == gw {
+			if sessions[i].SessionKey == gatewayKey {
 				if usable(sessions[i]) {
 					return sessions[i]
 				}
@@ -152,31 +180,11 @@ func gatewayRewriteRequest(req *http.Request) {
 		req.Header.Set("sec-fetch-dest", "document")
 	}
 
-	sessionKey := req.Header.Get("X-Claude2Api-Key")
+	session, reserved := req.Context().Value(gatewayCompletionSession{}).(config.SessionInfo)
+	if !reserved {
+		session = gatewaySession(req)
+	}
 	req.Header.Del("X-Claude2Api-Key")
-	if sessionKey == "" {
-		if cookie := req.Header.Get("Cookie"); cookie != "" {
-			for _, part := range strings.Split(cookie, ";") {
-				part = strings.TrimSpace(part)
-				if strings.HasPrefix(part, localTokenCookie+"=") {
-					sessionKey, _ = url.QueryUnescape(strings.TrimPrefix(part, localTokenCookie+"="))
-					break
-				}
-			}
-		}
-	}
-	var session config.SessionInfo
-	if sessionKey != "" {
-		for i := range config.ConfigInstance.Sessions {
-			if config.ConfigInstance.Sessions[i].SessionKey == sessionKey {
-				session = config.ConfigInstance.Sessions[i]
-				break
-			}
-		}
-	}
-	if session.SessionKey == "" {
-		session = pickSession()
-	}
 
 	// Forward the same browser cookie state the client path uses: start from
 	// the full cookie file header (cf_bm, routingHint, …) when the session has
@@ -198,6 +206,26 @@ func gatewayRewriteRequest(req *http.Request) {
 
 	// The browser sends Host: localhost; claude.ai expects its own host,
 	// already set by Director via req.Host
+}
+
+func gatewaySession(req *http.Request) config.SessionInfo {
+	sessionKey := req.Header.Get("X-Claude2Api-Key")
+	if sessionKey == "" {
+		if cookie, err := req.Cookie(localTokenCookie); err == nil {
+			sessionKey, _ = url.QueryUnescape(cookie.Value)
+		}
+	}
+	cfg := config.ConfigInstance
+	cfg.RwMutx.RLock()
+	defer cfg.RwMutx.RUnlock()
+	if sessionKey != "" {
+		for _, session := range cfg.Sessions {
+			if session.SessionKey == sessionKey {
+				return session
+			}
+		}
+	}
+	return pickSession(cfg.Sessions, cfg.GatewayKey)
 }
 
 // gatewayModifyResponse rewrites claude.ai responses so they work when served

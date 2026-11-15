@@ -285,6 +285,10 @@ const keysPageHTML = `<!DOCTYPE html>
       </div>
     </div>
     <div class="mcp-field">
+      <label><input type="checkbox" id="mcpPerAccountSlots"> Tự gán slot MCP cho từng tài khoản</label>
+      <div class="hint">Khi bật, nhập URL kết thúc bằng /mcp để server tự gán /mcp/s1, /mcp/s2… theo thứ tự tài khoản.</div>
+    </div>
+    <div class="mcp-field">
       <label class="mcp-field-label" for="mcpAuthMode">Xác thực</label>
       <select id="mcpAuthMode" onchange="updateMCPAuthUI()">
         <option value="auth_required">Đăng nhập ngay</option>
@@ -1218,6 +1222,7 @@ async function syncMCP() {
   const urlInput = document.getElementById('mcpSyncUrl');
   const name = (nameInput.value || '').trim() || 'agent-mcp';
   const url = (urlInput.value || '').trim();
+  const perAccountSlots = document.getElementById('mcpPerAccountSlots').checked;
   const msg = document.getElementById('mcpSyncMsg');
   const resDiv = document.getElementById('mcpSyncResults');
   const authModeEl = document.getElementById('mcpAuthMode');
@@ -1258,7 +1263,8 @@ async function syncMCP() {
   const authLabels = { auth_required: 'Đăng nhập ngay', defer_auth: 'Đăng nhập khi cần', no_auth: 'Không đăng nhập' };
   const regLabels = { cimd: 'CIMD', dcr: 'DCR', static_per_installation: 'OAuth client riêng' };
   let confirmText = 'Bạn có chắc muốn xóa tất cả MCP cũ và đồng bộ MCP mới cho TOÀN BỘ tài khoản trong pool không?\n\n' +
-    'Tên: ' + name + '\nURL: ' + url + '\nXác thực: ' + (authLabels[authMode] || authMode) +
+    'Tên: ' + name + '\nURL: ' + url + '\n' + (perAccountSlots ? 'Tự gán slot cho từng tài khoản' : 'Dùng chung URL cho mọi tài khoản') +
+    '\nXác thực: ' + (authLabels[authMode] || authMode) +
     '\nQuyền tool mặc định: ' + (MCP_MODE_LABELS[toolMode] || toolMode);
   if (requestHeaders.length) {
     confirmText += '\nRequest headers: ' + requestHeaders.length;
@@ -1285,6 +1291,7 @@ async function syncMCP() {
 
   try {
     const payload = { name: name, url: url, authMode: authMode, headers: requestHeaders, toolMode: toolMode };
+    if (perAccountSlots) payload.perAccountSlots = true;
     if (authMode !== 'no_auth') {
       payload.registration = registration;
       if (registration === 'static_per_installation') {
@@ -1351,7 +1358,7 @@ async function deleteMCP() {
 }
 
 function setMCPBusy(busy) {
-  ['mcpSyncBtn', 'mcpDeleteBtn', 'mcpAddHeaderBtn', 'mcpToolsLoadBtn', 'mcpPermApplyBtn'].forEach(function(id) {
+  ['mcpSyncBtn', 'mcpDeleteBtn', 'mcpAddHeaderBtn', 'mcpToolsLoadBtn', 'mcpPermApplyBtn', 'mcpPerAccountSlots'].forEach(function(id) {
     const el = document.getElementById(id);
     if (!el) return;
     el.disabled = busy;
@@ -1383,7 +1390,8 @@ function renderSyncResults(results, containerId) {
       badgeClass = 'limited';
     }
     html += '<div style="display:flex; justify-content:space-between; align-items:center; padding:.3rem 0; border-bottom:1px solid rgba(255,255,255,.05);">';
-    html += '<div><code>' + escapeHtml(r.account) + '</code> <span style="color:var(--muted); font-size:.8rem; margin-left:.5rem;">' + escapeHtml(r.message) + '</span></div>';
+    const slot = r.slot ? ' <code>/mcp/' + escapeHtml(r.slot) + '</code>' : '';
+    html += '<div><code>' + escapeHtml(r.account) + '</code>' + slot + ' <span style="color:var(--muted); font-size:.8rem; margin-left:.5rem;">' + escapeHtml(r.message) + '</span></div>';
     html += '<span class="badge ' + badgeClass + '" style="color:' + color + ';">' + tag + '</span>';
     html += '</div>';
   }

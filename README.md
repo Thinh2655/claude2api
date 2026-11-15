@@ -22,6 +22,8 @@ NOTICE: ONLY PRO USER CAN USE ALL MODELS , FREE USER ONLY CAN USE claude-sonnet-
 - 🔁 **Automatic Retry** - Feature to automatically retry requests when request fail
 - 🌐 **Direct Proxy** -let sk-ant-sid01* as key to use
 
+Each Claude account can process one chat completion at a time. Regular API requests try another free account when possible. Requests pinned to an IDE slot, Mirror API, or the browser gateway return `503` if the selected account is busy.
+
 ## 📋 Prerequisites
 
 - Go 1.23+ (for building from source)
